@@ -85,6 +85,32 @@ def trigger_tasker_autoinput(task_name, parameter_dict=None):
     run_cmd(intent_args)
 
 # ==============================================================================
+# 3.5. GPS LOCATION SPOOFING
+# ==============================================================================
+def spoof_gps(latitude, longitude):
+    """
+    Sets a mock GPS location on the Android device via ADB shell.
+    Requires 'Allow mock locations' (Developer options) enabled, or root, 
+    or setting mock location app via settings:
+       adb shell appops set <mock_app_package> android:mock_location allow
+    """
+    print(f"[*] Setting mock GPS location: Lat={latitude}, Lon={longitude}")
+    
+    # 1. Standard Android mock location setting (requires developer options / app setting enabled)
+    # We send mock location values using Android's location provider command (geo fix)
+    # Note: 'geo fix' requires telnet to emulator, or we can write mock locations using root settings provider.
+    # Alternatively, we can trigger location mock apps via command intents.
+    # Below uses the standard appops & location service method:
+    run_cmd(["shell", "settings", "put", "secure", "mock_location", "1"])
+    
+    # Send broadcast intent to common location spoofer apps or set coordinates directly if rooted
+    # Here, we run mock location provider update:
+    run_cmd(["shell", "cmd", "location", "set-location-allow-mock", "true"])
+    run_cmd(["shell", "cmd", "location", "providers", "set-test-provider-location", "gps", 
+             "--latitude", str(latitude), "--longitude", str(longitude), "--accuracy", "5.0"])
+    print("[*] GPS spoof coordinates updated.")
+
+# ==============================================================================
 # 4. HUMAN AUTOMATION MATHEMATICS
 # ==============================================================================
 def apply_jitter(val, radius):
