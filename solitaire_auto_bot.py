@@ -141,6 +141,22 @@ def execute_move(board, move, sim_mode=False):
             start_coords = get_element_coords(board, "free", fi)
             end_coords = get_element_coords(board, "col", cj)
 
+    # Sanity-check: for moves that pop the top of a tableau column, make sure
+    # the physical top card actually matches what the solver believes is
+    # there. Board state and solver state can diverge (e.g. a revealed card
+    # whose suit couldn't be read gets dropped from the solver's view), and
+    # blindly swiping in that case would drag the wrong real card.
+    if kind in ("col_to_found", "col_to_col", "col_to_free"):
+        ci = move[1]
+        physical_col = board[f"col{ci}"]
+        top = physical_col[-1] if physical_col else None
+        card = move[-1]
+        if not top or top.get("rank") != card[0] or top.get("suit") != card[1]:
+            print(f"[Warn] Skipping move {move}: physical top of col{ci} "
+                  f"({top}) does not match solver's expected card {card}. "
+                  f"Board read is stale or ambiguous; will re-read next cycle.")
+            return
+
     if start_coords and end_coords:
         x1, y1 = start_coords
         x2, y2 = end_coords
@@ -218,8 +234,21 @@ def main():
         for idx in range(7):
             col = []
             for c in board[f"col{idx}"]:
+                if c and c.get("rank") == "?" and c.get("color") == "?":
+                    # genuinely face-down card, always a leading run - not part
+                    # of the playable stack yet, safe to skip
+                    continue
                 if c and "suit" in c:
                     col.append((c["rank"], c["suit"]))
+                else:
+                    # revealed card but rank/suit couldn't be resolved - we
+                    # can't trust our read of this card or anything above it
+                    # in the stack, so stop here instead of silently
+                    # continuing past it (which would shift the rest of the
+                    # column up and make the solver think a buried card is
+                    # the exposed one)
+                    print(f"[Warn] col{idx}: unresolved card {c!r}; truncating column read here")
+                    break
             cols.append(col)
 
         free = []
