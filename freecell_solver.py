@@ -63,6 +63,29 @@ def generate_moves(state, last_move=None):
     free = state.free
     found = state.found_dict()
 
+    # 1. Check for safe auto-plays to foundation. If found, prune all other branches and play immediately.
+    for ci, col in enumerate(cols):
+        if col and can_found(col[-1], found):
+            card = col[-1]
+            r, s = card
+            rv = rank_val(r)
+            if rv <= 1:  # Ace or 2 is always safe
+                return [("col_to_found", ci, card)]
+            opposite_suits = ("S", "C") if s in ("H", "D") else ("H", "D")
+            if all(found.get(osut, -1) >= rv - 1 for osut in opposite_suits):
+                return [("col_to_found", ci, card)]
+
+    for card in free:
+        if can_found(card, found):
+            r, s = card
+            rv = rank_val(r)
+            if rv <= 1:  # Ace or 2 is always safe
+                return [("free_to_found", card)]
+            opposite_suits = ("S", "C") if s in ("H", "D") else ("H", "D")
+            if all(found.get(osut, -1) >= rv - 1 for osut in opposite_suits):
+                return [("free_to_found", card)]
+
+    # 2. Standard fallback moves (if no safe auto-plays are present)
     for ci, col in enumerate(cols):
         if col and can_found(col[-1], found):
             moves.append(("col_to_found", ci, col[-1]))

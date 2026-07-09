@@ -85,6 +85,59 @@ def get_element_coords(board, item_type, index):
         
     return None
 
+
+def card_color(suit):
+    return "RED" if suit in ("H", "D") else "BLACK"
+
+
+def apply_move_to_board(board, move):
+    """
+    Mirrors freecell_solver.apply_move, but mutates the CV-read `board` dict
+    (lists of card dicts) instead of the solver's compact (rank, suit)
+    tuples. This keeps `board` in sync with the physical game after we
+    execute a move without paying for a fresh screenshot + CV read, so a
+    whole batch of moves can be run per screen-read cycle instead of one.
+    """
+    kind = move[0]
+
+    def find_free(rank, suit):
+        for idx, c in enumerate(board["free_cells"]):
+            if c and c.get("rank") == rank and c.get("suit") == suit:
+                return idx
+        return None
+
+    def first_empty_free():
+        for idx, c in enumerate(board["free_cells"]):
+            if c is None:
+                return idx
+        return None
+
+    if kind == "col_to_found":
+        _, ci, card = move
+        board[f"col{ci}"].pop()
+    elif kind == "free_to_found":
+        _, card = move
+        fi = find_free(card[0], card[1])
+        if fi is not None:
+            board["free_cells"][fi] = None
+    elif kind == "col_to_col":
+        _, ci, cj, card = move
+        board[f"col{ci}"].pop()
+        board[f"col{cj}"].append({"rank": card[0], "suit": card[1], "color": card_color(card[1]), "score": 1.0})
+    elif kind == "col_to_free":
+        _, ci, card = move
+        board[f"col{ci}"].pop()
+        fi = first_empty_free()
+        if fi is not None:
+            board["free_cells"][fi] = {"rank": card[0], "suit": card[1], "color": card_color(card[1]), "score": 1.0}
+    elif kind == "free_to_col":
+        _, cj, card = move
+        fi = find_free(card[0], card[1])
+        if fi is not None:
+            board["free_cells"][fi] = None
+        board[f"col{cj}"].append({"rank": card[0], "suit": card[1], "color": card_color(card[1]), "score": 1.0})
+
+
 # ==============================================================================
 # 3. MOVE TRANSLATION TO PHYSICAL GESTURES
 # ==============================================================================
@@ -155,18 +208,27 @@ def execute_move(board, move, sim_mode=False):
             print(f"[Warn] Skipping move {move}: physical top of col{ci} "
                   f"({top}) does not match solver's expected card {card}. "
                   f"Board read is stale or ambiguous; will re-read next cycle.")
-            return
+            return False
 
     if start_coords and end_coords:
         x1, y1 = start_coords
         x2, y2 = end_coords
-        print(f"[*] Action: Move {kind.replace('_', ' ')}: {move[2] if len(move) > 2 else card} from ({x1}, {y1}) to ({x2}, {y2})")
-        if sim_mode:
-            print(f"   [Simulation] Would swipe: bridge.swipe({x1}, {y1}, {x2}, {y2})")
+        if kind in ("col_to_found", "free_to_found"):
+            print(f"[*] Action: Tap to Foundation: {move[2] if len(move) > 2 else card} at ({x1}, {y1})")
+            if sim_mode:
+                print(f"   [Simulation] Would tap: bridge.tap({x1}, {y1})")
+            else:
+                bridge.tap(x1, y1)
         else:
-            bridge.swipe(x1, y1, x2, y2)
+            print(f"[*] Action: Move {kind.replace('_', ' ')}: {move[2] if len(move) > 2 else card} from ({x1}, {y1}) to ({x2}, {y2})")
+            if sim_mode:
+                print(f"   [Simulation] Would swipe: bridge.swipe({x1}, {y1}, {x2}, {y2})")
+            else:
+                bridge.swipe(x1, y1, x2, y2)
+        return True
     else:
         print(f"[Error] Failed to resolve coordinates for move: {move}")
+        return False
 
 # ==============================================================================
 # 4. MAIN LOOP
@@ -177,6 +239,23 @@ def main():
         "--sim", 
         type=str, 
         help="Run in simulation/dry-run mode on a static screenshot file path instead of a live device."
+    )
+    parser.add_argument(
+        "--moves-per-cycle",
+        type=int,
+        default=5,
+        help="Max solved moves to execute before re-capturing the screen and re-solving "
+             "(0 = execute the entire computed path in one go). Between moves in a batch "
+             "we update our local board model instead of re-reading the screen, so higher "
+             "values are faster but rely on the physical game matching our model exactly; "
+             "lower values re-verify against a fresh screenshot more often. Default: 5.",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=1.5,
+        help="Seconds to wait after a batch of moves for the UI to settle before the next "
+             "screen capture. Default: 1.5.",
     )
     args = parser.parse_args()
 
@@ -275,12 +354,17 @@ def main():
             print(f"[-] Time/State limit hit. Best partial path: {len(path)} moves (explored {explored} states)")
 
         if path:
-            print("[*] Recommended move sequence:")
-            for idx, mv in enumerate(path[:10]):
+            batch = path if args.moves_per_cycle <= 0 else path[:args.moves_per_cycle]
+            print(f"[*] Executing {len(batch)} move(s) this cycle:")
+            for idx, mv in enumerate(batch):
                 print(f"  {idx+1}. {mv}")
-            
-            # Execute the first step
-            execute_move(board, path[0], sim_mode=sim_mode)
+                ok = execute_move(board, mv, sim_mode=sim_mode)
+                if not ok:
+                    print("[*] Stopping batch early; will re-read the board next cycle.")
+                    break
+                # Keep our local board model in sync so the next move's
+                # coordinates can be computed without re-reading the screen.
+                apply_move_to_board(board, mv)
         else:
             print("[*] No moves found. Board might already be solved or no path exists.")
 
@@ -289,8 +373,8 @@ def main():
             break
         
         # Interval wait between cycles
-        print("[*] Waiting for UI update (3 seconds)...")
-        time.sleep(3.0)
+        print(f"[*] Waiting for UI update ({args.interval}s)...")
+        time.sleep(args.interval)
 
 if __name__ == "__main__":
     main()
