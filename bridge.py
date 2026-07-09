@@ -34,8 +34,8 @@ if IS_ANDROID:
     is_rooted = os.path.exists("/system/xbin/su") or os.path.exists("/system/bin/su")
     RUN_MODE = "LOCAL_ROOT" if is_rooted else "LOCAL_LADB"
 else:
-    # Default to HTTP_BRIDGE on desktop environments (keeps backwards compatibility)
-    RUN_MODE = "HTTP_BRIDGE"
+    # Default to PC_ADB on desktop environments to control connected phone
+    RUN_MODE = "PC_ADB"
 
 print(f"[*] bridge.py environment: {'Android (Pydroid 3/Termux)' if IS_ANDROID else 'Desktop OS'}")
 print(f"[*] bridge.py RUN_MODE set to: {RUN_MODE} (HUMAN_MODE: {HUMAN_MODE})")
@@ -190,28 +190,52 @@ def screenshot():
     from PIL import Image
 
     if RUN_MODE == "HTTP_BRIDGE":
-        resp = requests.get(f"{BASE_URL}/screenshot", timeout=10)
-        resp.raise_for_status()
-        return Image.open(io.BytesIO(resp.content)).convert("RGB")
+        try:
+            resp = requests.get(f"{BASE_URL}/screenshot", timeout=10)
+            resp.raise_for_status()
+            return Image.open(io.BytesIO(resp.content)).convert("RGB")
+        except Exception as e:
+            print(f"[Error] Failed to fetch screenshot from HTTP bridge: {e}", file=sys.stderr)
+            return None
     else:
         # For non-HTTP modes, capture screen directly using Android command and pull it
         temp_path = "/sdcard/screen_tmp.png"
         dest_path = "screen_tmp.png"
+        
+        # Remove any existing local screenshot to ensure we don't read a stale one on failure
+        if os.path.exists(dest_path):
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+                
         print(f"Capturing screenshot via shell ({RUN_MODE})...")
         run_cmd(["shell", "screencap", "-p", temp_path])
         
         # Pull the file if in PC_ADB mode, otherwise load it locally
         if RUN_MODE == "PC_ADB":
             run_cmd(["pull", temp_path, dest_path])
-            img = Image.open(dest_path).convert("RGB")
-            # Cleanup local temp file
-            if os.path.exists(dest_path):
+            if not os.path.exists(dest_path):
+                print("[Error] Failed to pull screenshot from device. Is it unauthorized or disconnected?", file=sys.stderr)
+                return None
+            try:
+                img = Image.open(dest_path).convert("RGB")
                 os.remove(dest_path)
-            return img
+                return img
+            except Exception as e:
+                print(f"[Error] Failed to open pulled screenshot: {e}", file=sys.stderr)
+                return None
         else:
             # Running directly on Android
-            img = Image.open(temp_path).convert("RGB")
-            return img
+            if not os.path.exists(temp_path):
+                print("[Error] Screenshot file not found on device.", file=sys.stderr)
+                return None
+            try:
+                img = Image.open(temp_path).convert("RGB")
+                return img
+            except Exception as e:
+                print(f"[Error] Failed to open screenshot on device: {e}", file=sys.stderr)
+                return None
 
 
 # ==============================================================================
