@@ -180,9 +180,15 @@ def execute_move(board, move, sim_mode=False):
 def main():
     parser = argparse.ArgumentParser(description="Automated Solitaire Stash Bot")
     parser.add_argument(
-        "--sim", 
-        type=str, 
+        "--sim",
+        type=str,
         help="Run in simulation/dry-run mode on a static screenshot file path instead of a live device."
+    )
+    parser.add_argument(
+        "--solver",
+        choices=["search", "monte-carlo"],
+        default="search",
+        help="Choose the move-selection engine."
     )
     args = parser.parse_args()
 
@@ -272,23 +278,34 @@ def main():
         print(f"  Free: {free}")
         print(f"  Found: {found}")
 
-        print("[*] Searching for a path...")
-        path, explored, solved = solve(cols, initial_free=free, initial_found=found, time_limit=5.0)
+        if args.solver == "monte-carlo":
+            print("[*] Running Monte Carlo move search...")
+            state = State(cols, free, found)
+            move, statistics = choose_move_monte_carlo(state)
+            print_statistics(statistics)
 
-        if solved:
-            print(f"[+] FULLY SOLVED in {len(path)} moves (explored {explored} states)")
+            if move:
+                execute_move(board, move, sim_mode=sim_mode)
+            else:
+                print("[*] No moves found. Board might already be solved or no path exists.")
         else:
-            print(f"[-] Time/State limit hit. Best partial path: {len(path)} moves (explored {explored} states)")
+            print("[*] Searching for a path...")
+            path, explored, solved = solve(cols, initial_free=free, initial_found=found, time_limit=5.0)
 
-        if path:
-            print("[*] Recommended move sequence:")
-            for idx, mv in enumerate(path[:10]):
-                print(f"  {idx+1}. {mv}")
-            
-            # Execute the first step
-            execute_move(board, path[0], sim_mode=sim_mode)
-        else:
-            print("[*] No moves found. Board might already be solved or no path exists.")
+            if solved:
+                print(f"[+] FULLY SOLVED in {len(path)} moves (explored {explored} states)")
+            else:
+                print(f"[-] Time/State limit hit. Best partial path: {len(path)} moves (explored {explored} states)")
+
+            if path:
+                print("[*] Recommended move sequence:")
+                for idx, mv in enumerate(path[:10]):
+                    print(f"  {idx+1}. {mv}")
+
+                # Execute the first step
+                execute_move(board, path[0], sim_mode=sim_mode)
+            else:
+                print("[*] No moves found. Board might already be solved or no path exists.")
 
         if sim_mode:
             # Only run once in simulation mode
