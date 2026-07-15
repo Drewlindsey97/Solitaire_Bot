@@ -8,7 +8,13 @@ from board_reader_lib import (
     FREE_CELL_X, FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
     HIDDEN_CARD_H, STEP
 )
-from freecell_solver import solve, rank_val
+from freecell_solver import State, solve, rank_val
+
+from monte_carlo_solver import (
+    choose_move_monte_carlo,
+    print_statistics,
+)
+
 import bridge
 
 # ==============================================================================
