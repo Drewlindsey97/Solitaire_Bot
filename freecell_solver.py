@@ -57,35 +57,12 @@ def can_found(card, found):
     cur = found.get(s, -1)
     return rank_val(r) == cur + 1
 
-def generate_moves(state, last_move=None):
+def generate_complete_moves(state):
     moves = []
     cols = state.cols
     free = state.free
     found = state.found_dict()
 
-    # 1. Check for safe auto-plays to foundation. If found, prune all other branches and play immediately.
-    for ci, col in enumerate(cols):
-        if col and can_found(col[-1], found):
-            card = col[-1]
-            r, s = card
-            rv = rank_val(r)
-            if rv <= 1:  # Ace or 2 is always safe
-                return [("col_to_found", ci, card)]
-            opposite_suits = ("S", "C") if s in ("H", "D") else ("H", "D")
-            if all(found.get(osut, -1) >= rv - 1 for osut in opposite_suits):
-                return [("col_to_found", ci, card)]
-
-    for card in free:
-        if can_found(card, found):
-            r, s = card
-            rv = rank_val(r)
-            if rv <= 1:  # Ace or 2 is always safe
-                return [("free_to_found", card)]
-            opposite_suits = ("S", "C") if s in ("H", "D") else ("H", "D")
-            if all(found.get(osut, -1) >= rv - 1 for osut in opposite_suits):
-                return [("free_to_found", card)]
-
-    # 2. Standard fallback moves (if no safe auto-plays are present)
     for ci, col in enumerate(cols):
         if col and can_found(col[-1], found):
             moves.append(("col_to_found", ci, col[-1]))
@@ -122,11 +99,50 @@ def generate_moves(state, last_move=None):
     if len(free) < 4:
         for ci, col in enumerate(cols):
             if col:
-                move = ("col_to_free", ci, col[-1])
-                if last_move and last_move[0] == "free_to_col" and last_move[2] == col[-1]:
-                    continue
-                moves.append(move)
+                moves.append(("col_to_free", ci, col[-1]))
 
+    return moves
+
+
+def generate_moves(state, last_move=None):
+    cols = state.cols
+    free = state.free
+    found = state.found_dict()
+
+    # Check for safe auto-plays to foundation. If found, prune all other
+    # branches and play immediately. Complete legality is exposed separately
+    # by generate_complete_moves().
+    for ci, col in enumerate(cols):
+        if col and can_found(col[-1], found):
+            card = col[-1]
+            r, s = card
+            rv = rank_val(r)
+            if rv <= 1:  # Ace or 2 is always safe
+                return [("col_to_found", ci, card)]
+            opposite_suits = ("S", "C") if s in ("H", "D") else ("H", "D")
+            if all(found.get(osut, -1) >= rv - 1 for osut in opposite_suits):
+                return [("col_to_found", ci, card)]
+
+    for card in free:
+        if can_found(card, found):
+            r, s = card
+            rv = rank_val(r)
+            if rv <= 1:  # Ace or 2 is always safe
+                return [("free_to_found", card)]
+            opposite_suits = ("S", "C") if s in ("H", "D") else ("H", "D")
+            if all(found.get(osut, -1) >= rv - 1 for osut in opposite_suits):
+                return [("free_to_found", card)]
+
+    moves = generate_complete_moves(state)
+    if last_move:
+        moves = [
+            move for move in moves
+            if not (
+                move[0] == "col_to_free"
+                and last_move[0] == "free_to_col"
+                and last_move[2] == move[2]
+            )
+        ]
     return moves
 
 def apply_move(state, move):

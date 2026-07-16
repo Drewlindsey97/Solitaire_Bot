@@ -8,6 +8,7 @@ from typing import Optional
 from freecell_solver import (
     State,
     apply_move,
+    generate_complete_moves,
     generate_moves,
     rank_val,
 )
@@ -233,6 +234,7 @@ def choose_move_monte_carlo(
     time_limit: float = 3.0,
     max_depth: int = 100,
     seed: Optional[int] = None,
+    legal_moves: Optional[list[tuple]] = None,
 ) -> tuple[Optional[tuple], list[MoveStatistics]]:
     """
     Evaluate every legal opening move using randomized rollouts.
@@ -240,7 +242,16 @@ def choose_move_monte_carlo(
     The simulation budget is distributed round-robin so every legal move
     receives trials instead of one move consuming the whole time limit.
     """
-    legal_moves = generate_moves(state)
+    if legal_moves is None:
+        legal_moves = generate_moves(state)
+    else:
+        complete_moves = set(generate_complete_moves(state))
+        illegal_moves = [
+            move for move in legal_moves
+            if move not in complete_moves
+        ]
+        if illegal_moves:
+            raise ValueError(f"Illegal Monte Carlo candidate move(s): {illegal_moves!r}")
 
     if not legal_moves:
         return None, []
