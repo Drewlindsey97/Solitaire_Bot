@@ -166,7 +166,10 @@ def execute_move(board, move, sim_mode=False):
     if start_coords and end_coords:
         x1, y1 = start_coords
         x2, y2 = end_coords
-        print(f"[*] Action: Move {kind.replace('_', ' ')}: {move[2] if len(move) > 2 else card} from ({x1}, {y1}) to ({x2}, {y2})")
+        print(
+            f"[*] Action: {move} "
+            f"from ({x1}, {y1}) to ({x2}, {y2})"
+  )
         if sim_mode:
             print(f"   [Simulation] Would swipe: bridge.swipe({x1}, {y1}, {x2}, {y2})")
         else:
