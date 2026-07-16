@@ -12,7 +12,8 @@ from pathlib import Path
 from board_reader_lib import (
     read_board, TABLEAU_X, TABLEAU_Y_TOP, COL_WIDTH,
     FREE_CELL_X, FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
-    HIDDEN_CARD_H, STEP, BoardLayout, save_calibration_artifacts
+    HIDDEN_CARD_H, STEP, BoardLayout, save_calibration_artifacts,
+    save_exposed_card_diagnostics,
 )
 from freecell_solver import (
     State,
@@ -1080,6 +1081,13 @@ def main():
         default="logs/calibration/latest",
         help="Directory for --calibrate-layout artifacts. Default: logs/calibration/latest.",
     )
+    parser.add_argument(
+        "--debug-exposed-card",
+        action="append",
+        default=[],
+        metavar="COLUMN,INDEX",
+        help="Write targeted diagnostics for an exposed tableau card and exit without gestures. Repeatable.",
+    )
     args = parser.parse_args()
 
     sim_mode = args.sim is not None
@@ -1133,6 +1141,41 @@ def main():
             rows = column.get("rows", [])
             rejections = column.get("rejections", [])
             print(f"  col{idx}: rows={len(rows)} rejections={rejections}")
+        if session_logger is not None:
+            session_logger.close()
+        return
+
+    if args.debug_exposed_card:
+        if not sim_mode:
+            print("[Error] --debug-exposed-card requires --sim and never captures or gestures on a live device.", file=sys.stderr)
+            if session_logger is not None:
+                session_logger.close()
+            sys.exit(2)
+        for spec in args.debug_exposed_card:
+            try:
+                column_text, index_text = spec.split(",", 1)
+                column = int(column_text)
+                index = int(index_text)
+            except ValueError:
+                print(f"[Error] Invalid --debug-exposed-card value: {spec!r}. Expected COLUMN,INDEX.", file=sys.stderr)
+                if session_logger is not None:
+                    session_logger.close()
+                sys.exit(2)
+            output_dir = Path(args.calibration_dir)
+            if len(args.debug_exposed_card) > 1:
+                output_dir = output_dir / f"col{column}_{index}"
+            print(f"[*] Writing exposed-card diagnostics for col{column}[{index}] to: {output_dir}")
+            diagnostic = save_exposed_card_diagnostics(
+                screenshot_file,
+                column,
+                index,
+                output_dir,
+                layout=layout,
+            )
+            result = diagnostic["recognition"]["current_recognition_result"]
+            rank_result = diagnostic["recognition"]["independent_rank_result"]
+            print(f"  current={result}")
+            print(f"  rank={rank_result['rank']} score={rank_result['score']} source={rank_result['selected_source']}")
         if session_logger is not None:
             session_logger.close()
         return

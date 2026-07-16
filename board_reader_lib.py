@@ -169,22 +169,175 @@ def classify_suit_color(patch):
 
 
 def match_rank(patch, template_set):
-    if patch.size == 0:
-        return "?", 0.0
-    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    padded = cv2.copyMakeBorder(binary, PAD, PAD, PAD, PAD, cv2.BORDER_CONSTANT, value=0)
+    best_name, best_score, _ = match_rank_detailed(patch, template_set)
+    return best_name, best_score
 
-    best_name, best_score = "?", -1
+
+def preprocess_rank_variants(patch, size=None):
+    if patch.size == 0:
+        return {}
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    variants = {}
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    variants["otsu_inv"] = otsu
+    variants["adaptive_inv"] = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 8
+    )
+    variants["contrast_otsu_inv"] = cv2.threshold(
+        cv2.equalizeHist(gray), 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )[1]
+    if size is not None:
+        variants = {
+            name: cv2.resize(image, size, interpolation=cv2.INTER_NEAREST)
+            for name, image in variants.items()
+        }
+    return variants
+
+
+def _template_score(candidate, template):
+    scores = []
+    if template.shape == candidate.shape:
+        result = cv2.matchTemplate(candidate, template, cv2.TM_CCOEFF_NORMED)
+        scores.append(float(result.max()))
+    padded = cv2.copyMakeBorder(candidate, PAD, PAD, PAD, PAD, cv2.BORDER_CONSTANT, value=0)
+    if template.shape[0] <= padded.shape[0] and template.shape[1] <= padded.shape[1]:
+        result = cv2.matchTemplate(padded, template, cv2.TM_CCOEFF_NORMED)
+        scores.append(float(result.max()))
+    else:
+        resized = cv2.resize(candidate, (template.shape[1], template.shape[0]), interpolation=cv2.INTER_NEAREST)
+        result = cv2.matchTemplate(resized, template, cv2.TM_CCOEFF_NORMED)
+        scores.append(float(result.max()))
+    return max(scores) if scores else -1.0
+
+
+def match_rank_detailed(patch, template_set):
+    if patch.size == 0:
+        return "?", 0.0, []
+    best_name, best_score, best_variant = "?", -1.0, None
+    candidates = {}
     for name, tmpl in template_set.items():
-        if tmpl.shape[0] > padded.shape[0] or tmpl.shape[1] > padded.shape[1]:
-            continue
-        result = cv2.matchTemplate(padded, tmpl, cv2.TM_CCOEFF_NORMED)
-        score = result.max()
+        scores = []
+        for variant_name, variant in preprocess_rank_variants(patch).items():
+            scores.append((_template_score(variant, tmpl), variant_name))
+            normalized = cv2.resize(variant, (tmpl.shape[1], tmpl.shape[0]), interpolation=cv2.INTER_NEAREST)
+            scores.append((_template_score(normalized, tmpl), f"{variant_name}_normalized"))
+        score, variant_name = max(scores, key=lambda item: item[0])
+        candidates[name] = {"score": score, "variant": variant_name}
         if score > best_score:
             best_score = score
             best_name = name
-    return best_name, best_score
+            best_variant = variant_name
+    ranked = [
+        {"rank": name, "score": round(float(data["score"]), 4), "variant": data["variant"]}
+        for name, data in sorted(candidates.items(), key=lambda item: item[1]["score"], reverse=True)
+    ]
+    return best_name, best_score, ranked
+
+
+def recognize_card_rank(img, x, y, is_last, layout: BoardLayout):
+    attempts = []
+    if is_last:
+        full_patch = _safe_crop(img, x, y, layout.last_card_crop_width, layout.last_card_crop_height)
+        name, score, ranked = match_rank_detailed(full_patch, TEMPLATES_LAST)
+        attempts.append({"source": "full_last_card", "rank": name, "score": score, "candidates": ranked})
+        corner_patch = _safe_crop(img, x, y, layout.rank_width, layout.rank_height)
+        name, score, ranked = match_rank_detailed(corner_patch, TEMPLATES)
+        attempts.append({"source": "rank_corner", "rank": name, "score": score, "candidates": ranked})
+        heuristic = live_shape_rank_heuristic(full_patch)
+        if heuristic is not None:
+            attempts.append({
+                "source": "live_shape_heuristic",
+                "rank": heuristic["rank"],
+                "score": heuristic["score"],
+                "candidates": heuristic["candidates"],
+            })
+    else:
+        corner_patch = _safe_crop(img, x, y, layout.rank_width, layout.rank_height)
+        name, score, ranked = match_rank_detailed(corner_patch, TEMPLATES)
+        attempts.append({"source": "rank_corner", "rank": name, "score": score, "candidates": ranked})
+    best = max(attempts, key=lambda item: item["score"])
+    return best["rank"], best["score"], {
+        "selected_source": best["source"],
+        "attempts": [
+            {
+                "source": item["source"],
+                "rank": item["rank"],
+                "score": round(float(item["score"]), 4),
+                "candidates": item["candidates"][:10],
+            }
+            for item in attempts
+        ],
+    }
+
+
+def _rank_ink_mask(patch):
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    red1 = cv2.inRange(hsv, np.array([0, 50, 40]), np.array([15, 255, 255]))
+    red2 = cv2.inRange(hsv, np.array([160, 50, 40]), np.array([180, 255, 255]))
+    dark = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 100, 110]))
+    return cv2.morphologyEx(cv2.bitwise_or(cv2.bitwise_or(red1, red2), dark), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+
+
+def live_shape_rank_heuristic(patch):
+    if patch.size == 0:
+        return None
+    mask = _rank_ink_mask(patch)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        if area > 40:
+            boxes.append({"x": x, "y": y, "w": w, "h": h, "area": float(area)})
+    if not boxes:
+        return None
+    large = [box for box in boxes if box["y"] >= 35 and box["h"] >= 35]
+    top = [box for box in boxes if box["y"] <= 8 and box["h"] >= 20]
+    candidates = []
+
+    widest = max(large, key=lambda box: box["w"], default=None)
+    if widest and widest["w"] >= 55 and widest["h"] >= 40:
+        score = min(0.92, 0.62 + (widest["w"] - 55) / 40 + widest["area"] / 10000)
+        candidates.append({"rank": "Q", "score": round(float(score), 4), "variant": "wide_loop_shape"})
+
+    lower_digits = sorted(
+        [box for box in large if box["w"] >= 20 and box["area"] > 250],
+        key=lambda box: box["x"],
+    )
+    top_wide = any(box["w"] >= 28 and box["h"] >= 24 for box in top)
+    if len(lower_digits) >= 2 and top_wide:
+        left, right = lower_digits[0], lower_digits[1]
+        if left["x"] < right["x"] and left["w"] < right["w"] * 0.85:
+            score = min(0.9, 0.64 + (right["area"] + left["area"]) / 12000)
+            candidates.append({"rank": "10", "score": round(float(score), 4), "variant": "two_digit_shape"})
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return {
+        "rank": candidates[0]["rank"],
+        "score": candidates[0]["score"],
+        "candidates": candidates,
+    }
+
+
+def classify_suit_color_detailed(patch):
+    if patch.size == 0:
+        return "?", [{"color": "RED", "score": 0.0}, {"color": "BLACK", "score": 0.0}]
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    mask = gray < 200
+    if mask.sum() < 5:
+        return "?", [{"color": "RED", "score": 0.0}, {"color": "BLACK", "score": 0.0}]
+    b, g, r = patch[mask].mean(axis=0)
+    red_score = max(0.0, float((r - max(g, b)) / 255.0))
+    dark_score = max(0.0, float((200.0 - gray[mask].mean()) / 200.0))
+    black_score = dark_score * (1.0 - min(1.0, red_score * 3.0))
+    candidates = [
+        {"color": "RED", "score": round(red_score, 4), "mean_rgb": [round(float(r), 2), round(float(g), 2), round(float(b), 2)]},
+        {"color": "BLACK", "score": round(black_score, 4), "mean_rgb": [round(float(r), 2), round(float(g), 2), round(float(b), 2)]},
+    ]
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return candidates[0]["color"] if candidates[0]["score"] > 0 else "?", candidates
 
 
 def default_transform_for_image(img: np.ndarray, layout: BoardLayout = REFERENCE_LAYOUT) -> BoardTransform:
@@ -352,15 +505,13 @@ def _scan_rows_for_column(
             break
         is_last = row == revealed_count - 1
         if is_last:
-            rank_patch = _safe_crop(img, x, y, layout.last_card_crop_width, layout.last_card_crop_height)
-            name, score = match_rank(rank_patch, TEMPLATES_LAST)
+            name, score, rank_details = recognize_card_rank(img, x, y, is_last, layout)
             color_patch = _safe_crop(img, x + 55, y + 20, 35, 20)
-            color = classify_suit_color(color_patch)
+            color, color_candidates = classify_suit_color_detailed(color_patch)
         else:
-            rank_patch = _safe_crop(img, x, y, layout.rank_width, layout.rank_height)
-            name, score = match_rank(rank_patch, TEMPLATES)
+            name, score, rank_details = recognize_card_rank(img, x, y, is_last, layout)
             suit_patch = _safe_crop(img, x + layout.suit_x_offset, y + layout.suit_y_offset, layout.suit_width, layout.suit_height)
-            color = classify_suit_color(suit_patch)
+            color, color_candidates = classify_suit_color_detailed(suit_patch)
         if score < layout.min_rank_score:
             report["rejections"].append({"reason": "low_confidence_rank", "y": y, "rank": name, "score": float(score)})
             name, color, score = "?", "?", 0.0
@@ -371,9 +522,19 @@ def _scan_rows_for_column(
             "score": round(float(score), 2),
             "face_down": False,
             "provenance": "ocr_visible",
+            "recognition": rank_details,
+            "color_candidates": color_candidates,
         }
         cards.append(card)
-        report["rows"].append({"kind": "revealed", "y": y, "rank": name, "color": color, "score": round(float(score), 3)})
+        report["rows"].append({
+            "kind": "revealed",
+            "y": y,
+            "rank": name,
+            "color": color,
+            "score": round(float(score), 3),
+            "recognition": rank_details,
+            "color_candidates": color_candidates,
+        })
 
     if any(b <= a for a, b in zip(row_positions, row_positions[1:])):
         report["rejections"].append({"reason": "non_monotonic_rows", "rows": row_positions})
@@ -602,3 +763,114 @@ def save_calibration_artifacts(image_or_path, calibration_dir, layout: BoardLayo
     }
     (out / "detection_report.json").write_text(json.dumps(detection_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return detection_payload
+
+
+def _write_threshold_artifacts(patch: np.ndarray, out: Path) -> None:
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    cv2.imwrite(str(out / "threshold_otsu_inv.png"), preprocess_rank_variants(patch)["otsu_inv"])
+    cv2.imwrite(str(out / "threshold_adaptive_inv.png"), preprocess_rank_variants(patch)["adaptive_inv"])
+    cv2.imwrite(str(out / "threshold_contrast_otsu_inv.png"), preprocess_rank_variants(patch)["contrast_otsu_inv"])
+    cv2.imwrite(str(out / "edges.png"), cv2.Canny(gray, 80, 160))
+
+
+def save_exposed_card_diagnostics(
+    image_or_path,
+    column: int,
+    index: int,
+    output_dir,
+    layout: BoardLayout | None = None,
+) -> dict[str, Any]:
+    layout = layout or REFERENCE_LAYOUT
+    original = _load_image(image_or_path)
+    result = read_board(original, layout=layout, include_metadata=True)
+    calibrated_layout: BoardLayout = result["layout"]
+    transform: BoardTransform = result["transform"]
+    normalized = result["normalized_image"]
+    report = result["detection_report"]["columns"][column]
+    rows = report["rows"]
+    if index < 0 or index >= len(rows):
+        raise IndexError(f"Column {column} has {len(rows)} detected rows, cannot debug row {index}")
+    row = rows[index]
+    if row["kind"] != "revealed":
+        raise ValueError(f"Column {column} row {index} is {row['kind']}, not an exposed card")
+
+    x = int(calibrated_layout.tableau_x[column])
+    y = int(row["y"])
+    full_rect = (x, y, calibrated_layout.last_card_crop_width, calibrated_layout.full_card_height)
+    rank_rect = (x, y, calibrated_layout.rank_width, calibrated_layout.rank_height)
+    suit_rect = (x + 55, y + 20, 35, 20)
+    full_card = _safe_crop(normalized, *full_rect)
+    rank_crop = _safe_crop(normalized, *rank_rect)
+    suit_crop = _safe_crop(normalized, *suit_rect)
+
+    out = Path(output_dir)
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out / "full_original_card_crop.png"), full_card)
+    cv2.imwrite(str(out / "rank_crop.png"), rank_crop)
+    cv2.imwrite(str(out / "suit_color_crop.png"), suit_crop)
+    cv2.imwrite(str(out / "enlarged_nearest.png"), cv2.resize(full_card, None, fx=4, fy=4, interpolation=cv2.INTER_NEAREST))
+    cv2.imwrite(str(out / "enlarged_interpolated.png"), cv2.resize(full_card, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC))
+    _write_threshold_artifacts(rank_crop, out)
+
+    rank, score, rank_details = recognize_card_rank(normalized, x, y, True, calibrated_layout)
+    color, color_candidates = classify_suit_color_detailed(suit_crop)
+    current_card = result["board"][f"col{column}"][index]
+    rejection_reason = None
+    for rejection in report.get("rejections", []):
+        if rejection.get("y") == y:
+            rejection_reason = rejection
+            break
+
+    def map_rect(rect):
+        rx, ry, rw, rh = rect
+        x1, y1 = transform.normalized_to_original(rx, ry)
+        x2, y2 = transform.normalized_to_original(rx + rw, ry + rh)
+        return {
+            "normalized": {"x": rx, "y": ry, "w": rw, "h": rh},
+            "original": {
+                "x": round(x1, 3),
+                "y": round(y1, 3),
+                "w": round(x2 - x1, 3),
+                "h": round(y2 - y1, 3),
+            },
+        }
+
+    coordinates = {
+        "column": column,
+        "index": index,
+        "full_card": map_rect(full_rect),
+        "rank": map_rect(rank_rect),
+        "suit_color": map_rect(suit_rect),
+    }
+    recognition = {
+        "current_recognition_result": current_card,
+        "independent_rank_result": {"rank": rank, "score": round(float(score), 4), **rank_details},
+        "top_10_rank_template_matches": next(
+            attempt["candidates"][:10]
+            for attempt in rank_details["attempts"]
+            if attempt["source"] == rank_details["selected_source"]
+        ),
+        "all_rank_attempts": rank_details["attempts"],
+        "top_color_suit_candidates": color_candidates,
+        "selected_color": color,
+        "rejection_reason": rejection_reason,
+        "template_set_selected": "rank_corner + full_last_card",
+        "template_set_reason": (
+            "Live exposed card art uses clean rank glyphs; full_last_card templates include old-game artwork, "
+            "so rank_corner is evaluated without overwriting existing templates."
+        ),
+    }
+    (out / "crop_coordinates.json").write_text(json.dumps(coordinates, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (out / "recognition_result.json").write_text(json.dumps(recognition, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (out / "diagnostics.json").write_text(json.dumps({
+        "coordinates": coordinates,
+        "recognition": recognition,
+        "layout": calibrated_layout.to_json_data(),
+        "transform": transform.to_json_data(),
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        "coordinates": coordinates,
+        "recognition": recognition,
+    }

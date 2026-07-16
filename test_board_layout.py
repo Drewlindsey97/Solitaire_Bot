@@ -11,8 +11,12 @@ import numpy as np
 from board_reader_lib import (
     BoardLayout,
     BoardTransform,
+    TEMPLATES,
+    match_rank_detailed,
+    preprocess_rank_variants,
     read_board,
     save_calibration_artifacts,
+    save_exposed_card_diagnostics,
     transform_from_content_rect,
 )
 from solitaire_auto_bot import get_element_coords, main
@@ -117,6 +121,63 @@ class BoardLayoutTests(unittest.TestCase):
             self.assertTrue((Path(temp_dir) / "normalized.png").exists())
             self.assertTrue((Path(temp_dir) / "layout_overlay.png").exists())
             self.assertIn("columns", report)
+
+    def test_preprocessing_variants_normalize_to_template_dimensions(self):
+        template = next(iter(TEMPLATES.values()))
+        patch = np.zeros((20, 30, 3), dtype=np.uint8)
+        variants = preprocess_rank_variants(patch, size=(template.shape[1], template.shape[0]))
+
+        self.assertIn("otsu_inv", variants)
+        self.assertIn("adaptive_inv", variants)
+        for image in variants.values():
+            self.assertEqual(image.shape, template.shape)
+
+    def test_match_rank_detailed_reports_preprocessing_variants(self):
+        template_name, template = next(iter(TEMPLATES.items()))
+        patch = cv2.cvtColor(cv2.bitwise_not(template), cv2.COLOR_GRAY2BGR)
+
+        name, score, candidates = match_rank_detailed(patch, TEMPLATES)
+
+        self.assertEqual(name, template_name)
+        self.assertGreater(score, 0.5)
+        self.assertIn("variant", candidates[0])
+
+    def test_low_confidence_blank_card_remains_unresolved(self):
+        patch = np.full((45, 45, 3), 255, dtype=np.uint8)
+
+        _, score, _ = match_rank_detailed(patch, TEMPLATES)
+
+        self.assertLess(score, BoardLayout().min_rank_score)
+
+    def test_diagnostic_artifact_creation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = save_exposed_card_diagnostics("live_before.png", 2, 2, temp_dir)
+            path = Path(temp_dir)
+
+            self.assertTrue((path / "full_original_card_crop.png").exists())
+            self.assertTrue((path / "rank_crop.png").exists())
+            self.assertTrue((path / "suit_color_crop.png").exists())
+            self.assertTrue((path / "diagnostics.json").exists())
+            self.assertEqual(result["coordinates"]["column"], 2)
+
+    def test_targeted_diagnostic_mode_never_executes_gesture(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            argv = [
+                "solitaire_auto_bot.py",
+                "--sim",
+                "live_before.png",
+                "--debug-exposed-card",
+                "2,2",
+                "--calibration-dir",
+                temp_dir,
+            ]
+            with patch("sys.argv", argv), \
+                    patch("bridge.tap") as tap, \
+                    patch("bridge.swipe") as swipe:
+                main()
+            tap.assert_not_called()
+            swipe.assert_not_called()
+            self.assertTrue((Path(temp_dir) / "diagnostics.json").exists())
 
 
 if __name__ == "__main__":
