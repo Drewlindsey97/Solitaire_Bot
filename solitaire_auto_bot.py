@@ -8,7 +8,13 @@ from board_reader_lib import (
     FREE_CELL_X, FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
     HIDDEN_CARD_H, STEP
 )
-from freecell_solver import solve, rank_val
+from freecell_solver import State, solve, rank_val
+
+from monte_carlo_solver import (
+    choose_move_monte_carlo,
+    print_statistics,
+)
+
 import bridge
 
 # ==============================================================================
@@ -236,8 +242,8 @@ def execute_move(board, move, sim_mode=False):
 def main():
     parser = argparse.ArgumentParser(description="Automated Solitaire Stash Bot")
     parser.add_argument(
-        "--sim", 
-        type=str, 
+        "--sim",
+        type=str,
         help="Run in simulation/dry-run mode on a static screenshot file path instead of a live device."
     )
     parser.add_argument(
@@ -256,6 +262,12 @@ def main():
         default=1.5,
         help="Seconds to wait after a batch of moves for the UI to settle before the next "
              "screen capture. Default: 1.5.",
+    )
+    parser.add_argument(
+        "--solver",
+        choices=["search", "monte-carlo"],
+        default="search",
+        help="Choose the move-selection engine. Default: search."
     )
     args = parser.parse_args()
 
@@ -345,28 +357,34 @@ def main():
         print(f"  Free: {free}")
         print(f"  Found: {found}")
 
-        print("[*] Searching for a path...")
-        path, explored, solved = solve(cols, initial_free=free, initial_found=found, time_limit=5.0)
+        if args.solver == "monte-carlo":
+            print("[*] Running Monte Carlo move search...")
+            state = State(cols, free, found)
+            move, statistics = choose_move_monte_carlo(state)
+            print_statistics(statistics)
 
-        if solved:
-            print(f"[+] FULLY SOLVED in {len(path)} moves (explored {explored} states)")
+            if move:
+                execute_move(board, move, sim_mode=sim_mode)
+            else:
+                print("[*] No moves found. Board might already be solved or no path exists.")
         else:
-            print(f"[-] Time/State limit hit. Best partial path: {len(path)} moves (explored {explored} states)")
+            print("[*] Searching for a path...")
+            path, explored, solved = solve(cols, initial_free=free, initial_found=found, time_limit=5.0)
 
-        if path:
-            batch = path if args.moves_per_cycle <= 0 else path[:args.moves_per_cycle]
-            print(f"[*] Executing {len(batch)} move(s) this cycle:")
-            for idx, mv in enumerate(batch):
-                print(f"  {idx+1}. {mv}")
-                ok = execute_move(board, mv, sim_mode=sim_mode)
-                if not ok:
-                    print("[*] Stopping batch early; will re-read the board next cycle.")
-                    break
-                # Keep our local board model in sync so the next move's
-                # coordinates can be computed without re-reading the screen.
-                apply_move_to_board(board, mv)
-        else:
-            print("[*] No moves found. Board might already be solved or no path exists.")
+            if path:
+                batch = path if args.moves_per_cycle <= 0 else path[:args.moves_per_cycle]
+                print(f"[*] Executing {len(batch)} move(s) this cycle:")
+                for idx, mv in enumerate(batch):
+                    print(f"  {idx+1}. {mv}")
+                    ok = execute_move(board, mv, sim_mode=sim_mode)
+                    if not ok:
+                        print("[*] Stopping batch early; will re-read the board next cycle.")
+                        break
+                    # Keep our local board model in sync so the next move's
+                    # coordinates can be computed without re-reading the screen.
+                    apply_move_to_board(board, mv)
+            else:
+                print("[*] No moves found. Board might already be solved or no path exists.")
 
         if sim_mode:
             # Only run once in simulation mode
