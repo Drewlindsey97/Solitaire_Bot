@@ -11,7 +11,7 @@ from pathlib import Path
 from board_reader_lib import (
     read_board, TABLEAU_X, TABLEAU_Y_TOP, COL_WIDTH,
     FREE_CELL_X, FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
-    HIDDEN_CARD_H, STEP
+    HIDDEN_CARD_H, STEP, BoardLayout, save_calibration_artifacts
 )
 from freecell_solver import (
     State,
@@ -97,36 +97,43 @@ def assign_pseudo_suits(board):
 # ==============================================================================
 # 2. COORDINATE RESOLUTION
 # ==============================================================================
-def get_element_coords(board, item_type, index):
+def get_element_coords(board, item_type, index, transform=None, layout=None):
     """
     Calculates the exact center coordinate (x, y) for target slots or top cards.
     """
+    layout = layout or BoardLayout()
     if item_type == "col":
         col_cards = board[f"col{index}"]
         num_cards = len(col_cards)
-        x_center = TABLEAU_X[index] + COL_WIDTH / 2
+        x_center = layout.tableau_x[index] + layout.column_width / 2
         
         if num_cards == 0:
             # Empty column click target
-            y_center = TABLEAU_Y_TOP + SLOT_H / 2
+            y_center = layout.tableau_y_top + layout.slot_height / 2
         else:
             # Find Y position of the bottom revealed card (exposed card)
             hidden_count = sum(1 for c in col_cards if c.get("rank") == "?")
             revealed_count = num_cards - hidden_count
-            y_edge = TABLEAU_Y_TOP + hidden_count * HIDDEN_CARD_H + max(0, revealed_count - 1) * STEP
-            y_center = y_edge + SLOT_H / 2
-        return int(x_center), int(y_center)
+            y_edge = layout.tableau_y_top + hidden_count * layout.hidden_card_step + max(0, revealed_count - 1) * layout.revealed_card_step
+            y_center = y_edge + layout.slot_height / 2
+        if transform is not None:
+            x_center, y_center = transform.normalized_to_original(x_center, y_center)
+        return int(round(x_center)), int(round(y_center))
         
     elif item_type == "free":
-        x_center = FREE_CELL_X[index] + SLOT_W / 2
-        y_center = SLOT_Y + SLOT_H / 2
-        return int(x_center), int(y_center)
+        x_center = layout.free_cell_x[index] + layout.slot_width / 2
+        y_center = layout.slot_y + layout.slot_height / 2
+        if transform is not None:
+            x_center, y_center = transform.normalized_to_original(x_center, y_center)
+        return int(round(x_center)), int(round(y_center))
         
     elif item_type == "found":
         # We only have one foundation pile coordinates defined
-        x_center = FOUNDATION_X[0] + SLOT_W / 2
-        y_center = SLOT_Y + SLOT_H / 2
-        return int(x_center), int(y_center)
+        x_center = layout.foundation_x[0] + layout.slot_width / 2
+        y_center = layout.slot_y + layout.slot_height / 2
+        if transform is not None:
+            x_center, y_center = transform.normalized_to_original(x_center, y_center)
+        return int(round(x_center)), int(round(y_center))
         
     return None
 
@@ -186,7 +193,7 @@ def apply_move_to_board(board, move):
 # ==============================================================================
 # 3. MOVE TRANSLATION TO PHYSICAL GESTURES
 # ==============================================================================
-def execute_move(board, move, sim_mode=False, event_logger=None):
+def execute_move(board, move, sim_mode=False, event_logger=None, transform=None, layout=None):
     """
     Translates a solver move into coordinates and triggers the swipe/tap.
     """
@@ -207,8 +214,8 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
 
     if kind == "col_to_found":
         _, ci, card = move
-        start_coords = get_element_coords(board, "col", ci)
-        end_coords = get_element_coords(board, "found", 0)
+        start_coords = get_element_coords(board, "col", ci, transform=transform, layout=layout)
+        end_coords = get_element_coords(board, "found", 0, transform=transform, layout=layout)
         
     elif kind == "free_to_found":
         _, card = move
@@ -219,13 +226,13 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
                 fi = idx
                 break
         if fi is not None:
-            start_coords = get_element_coords(board, "free", fi)
-            end_coords = get_element_coords(board, "found", 0)
+            start_coords = get_element_coords(board, "free", fi, transform=transform, layout=layout)
+            end_coords = get_element_coords(board, "found", 0, transform=transform, layout=layout)
             
     elif kind == "col_to_col":
         _, ci, cj, card = move
-        start_coords = get_element_coords(board, "col", ci)
-        end_coords = get_element_coords(board, "col", cj)
+        start_coords = get_element_coords(board, "col", ci, transform=transform, layout=layout)
+        end_coords = get_element_coords(board, "col", cj, transform=transform, layout=layout)
         
     elif kind == "col_to_free":
         _, ci, card = move
@@ -236,8 +243,8 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
                 fi = idx
                 break
         if fi is not None:
-            start_coords = get_element_coords(board, "col", ci)
-            end_coords = get_element_coords(board, "free", fi)
+            start_coords = get_element_coords(board, "col", ci, transform=transform, layout=layout)
+            end_coords = get_element_coords(board, "free", fi, transform=transform, layout=layout)
             
     elif kind == "free_to_col":
         _, cj, card = move
@@ -247,8 +254,8 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
                 fi = idx
                 break
         if fi is not None:
-            start_coords = get_element_coords(board, "free", fi)
-            end_coords = get_element_coords(board, "col", cj)
+            start_coords = get_element_coords(board, "free", fi, transform=transform, layout=layout)
+            end_coords = get_element_coords(board, "col", cj, transform=transform, layout=layout)
 
     # Sanity-check: for moves that pop the top of a tableau column, make sure
     # the physical top card actually matches what the solver believes is
@@ -485,9 +492,13 @@ def compare_normalized_state(expected_state, actual_normalized):
     }
 
 
-def read_and_normalize_board(screenshot_path, allow_best_effort=False):
-    board = read_board(str(screenshot_path))
-    return build_normalized_state(board, allow_best_effort=allow_best_effort)
+def read_and_normalize_board(screenshot_path, allow_best_effort=False, layout=None):
+    read_result = read_board(str(screenshot_path), layout=layout, include_metadata=True)
+    normalized = build_normalized_state(read_result["board"], allow_best_effort=allow_best_effort)
+    normalized["layout"] = read_result["layout"]
+    normalized["transform"] = read_result["transform"]
+    normalized["detection_report"] = read_result["detection_report"]
+    return normalized
 
 
 def capture_live_screenshot(path):
@@ -775,10 +786,27 @@ def main():
         default=0.75,
         help="Seconds to wait before each live verification attempt. Default: 0.75.",
     )
+    parser.add_argument(
+        "--layout-profile",
+        type=str,
+        help="Optional JSON BoardLayout profile to use instead of the built-in reference layout.",
+    )
+    parser.add_argument(
+        "--calibrate-layout",
+        action="store_true",
+        help="Write board-reader calibration artifacts for the selected screenshot and exit without gestures.",
+    )
+    parser.add_argument(
+        "--calibration-dir",
+        type=str,
+        default="logs/calibration/latest",
+        help="Directory for --calibrate-layout artifacts. Default: logs/calibration/latest.",
+    )
     args = parser.parse_args()
 
     sim_mode = args.sim is not None
     screenshot_file = args.sim if sim_mode else "live_screen.png"
+    layout = BoardLayout.from_json(args.layout_profile) if args.layout_profile else BoardLayout()
 
     # Enabling logcat also enables a structured session log unless the user
     # already supplied an explicit JSONL path.
@@ -813,6 +841,23 @@ def main():
             sys.exit(1)
     else:
         print(f"[*] Running in LIVE device mode (RUN_MODE: {bridge.RUN_MODE})")
+
+    if args.calibrate_layout:
+        if not sim_mode:
+            print("[Error] --calibrate-layout requires --sim and never captures or gestures on a live device.", file=sys.stderr)
+            if session_logger is not None:
+                session_logger.close()
+            sys.exit(2)
+        print(f"[*] Writing calibration artifacts to: {args.calibration_dir}")
+        report = save_calibration_artifacts(screenshot_file, args.calibration_dir, layout=layout)
+        print("[*] Calibration complete.")
+        for idx, column in enumerate(report["columns"]):
+            rows = column.get("rows", [])
+            rejections = column.get("rejections", [])
+            print(f"  col{idx}: rows={len(rows)} rejections={rejections}")
+        if session_logger is not None:
+            session_logger.close()
+        return
 
     cycle_number = 0
     interrupted = False
@@ -883,6 +928,7 @@ def main():
                 normalized = read_and_normalize_board(
                     before_screenshot,
                     allow_best_effort=sim_mode,
+                    layout=layout,
                 )
             except Exception as exc:
                 board_seconds = time.perf_counter() - board_started
@@ -1019,6 +1065,8 @@ def main():
                     batch_move,
                     sim_mode=sim_mode,
                     event_logger=lambda event_name, **data: log_event(event_name, cycle=cycle_number, **data),
+                    transform=normalized.get("transform"),
+                    layout=normalized.get("layout"),
                 )
                 log_event(
                     "move_result",

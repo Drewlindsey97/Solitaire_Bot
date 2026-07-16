@@ -1,25 +1,119 @@
-import cv2
+from __future__ import annotations
+
 import glob
+import json
 import os
+import shutil
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from typing import Any
+
+import cv2
 import numpy as np
 
-STEP = 50
-RANK_W, RANK_H = 45, 45
-SUIT_X_OFF, SUIT_Y_OFF = 5, 42
-SUIT_W, SUIT_H = 35, 22
+
+@dataclass(frozen=True)
+class BoardLayout:
+    reference_width: int = 720
+    reference_height: int = 1600
+    tableau_x: tuple[int, ...] = (10, 111, 212, 313, 414, 512, 611)
+    tableau_y_top: int = 507
+    column_width: int = 95
+    revealed_card_step: int = 50
+    hidden_card_step: int = 30
+    free_cell_x: tuple[int, ...] = (10, 110, 210, 310)
+    foundation_x: tuple[int, ...] = (472,)
+    slot_y: int = 303
+    slot_width: int = 95
+    slot_height: int = 90
+    rank_width: int = 45
+    rank_height: int = 45
+    suit_x_offset: int = 5
+    suit_y_offset: int = 42
+    suit_width: int = 35
+    suit_height: int = 22
+    last_card_crop_width: int = 95
+    last_card_crop_height: int = 90
+    full_card_height: int = 135
+    max_tableau_cards: int = 20
+    min_rank_score: float = 0.55
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "BoardLayout":
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        for key in ("tableau_x", "free_cell_x", "foundation_x"):
+            if key in data:
+                data[key] = tuple(data[key])
+        return cls(**data)
+
+    def to_json_data(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class BoardTransform:
+    original_width: int
+    original_height: int
+    content_x: float
+    content_y: float
+    content_width: float
+    content_height: float
+    reference_width: int
+    reference_height: int
+
+    @property
+    def scale_x(self) -> float:
+        return self.reference_width / self.content_width
+
+    @property
+    def scale_y(self) -> float:
+        return self.reference_height / self.content_height
+
+    def original_to_normalized(self, x: float, y: float) -> tuple[float, float]:
+        return ((x - self.content_x) * self.scale_x, (y - self.content_y) * self.scale_y)
+
+    def normalized_to_original(self, x: float, y: float) -> tuple[float, float]:
+        return (x / self.scale_x + self.content_x, y / self.scale_y + self.content_y)
+
+    def normalize_image(self, img: np.ndarray) -> np.ndarray:
+        x1 = max(0, int(round(self.content_x)))
+        y1 = max(0, int(round(self.content_y)))
+        x2 = min(self.original_width, int(round(self.content_x + self.content_width)))
+        y2 = min(self.original_height, int(round(self.content_y + self.content_height)))
+        cropped = img[y1:y2, x1:x2]
+        if cropped.shape[1] == self.reference_width and cropped.shape[0] == self.reference_height:
+            return cropped.copy()
+        return cv2.resize(cropped, (self.reference_width, self.reference_height), interpolation=cv2.INTER_AREA)
+
+    def to_json_data(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["scale_x"] = self.scale_x
+        data["scale_y"] = self.scale_y
+        return data
+
+
+REFERENCE_LAYOUT = BoardLayout()
+
+# Backward-compatible exports for existing helpers.
+STEP = REFERENCE_LAYOUT.revealed_card_step
+RANK_W, RANK_H = REFERENCE_LAYOUT.rank_width, REFERENCE_LAYOUT.rank_height
+SUIT_X_OFF, SUIT_Y_OFF = REFERENCE_LAYOUT.suit_x_offset, REFERENCE_LAYOUT.suit_y_offset
+SUIT_W, SUIT_H = REFERENCE_LAYOUT.suit_width, REFERENCE_LAYOUT.suit_height
 PAD = 15
-HIDDEN_CARD_H = 30
+HIDDEN_CARD_H = REFERENCE_LAYOUT.hidden_card_step
 TOP_RESIDUAL_TOLERANCE = 5
+TABLEAU_X = list(REFERENCE_LAYOUT.tableau_x)
+TABLEAU_Y_TOP = REFERENCE_LAYOUT.tableau_y_top
+COL_WIDTH = REFERENCE_LAYOUT.column_width
+FREE_CELL_X = list(REFERENCE_LAYOUT.free_cell_x)
+FOUNDATION_X = list(REFERENCE_LAYOUT.foundation_x)
+SLOT_Y = REFERENCE_LAYOUT.slot_y
+SLOT_W, SLOT_H = REFERENCE_LAYOUT.slot_width, REFERENCE_LAYOUT.slot_height
 
-# fixed x-start positions for each tableau column (UI layout doesn't move)
-TABLEAU_X = [10, 111, 212, 313, 414, 512, 611]
-TABLEAU_Y_TOP = 507
-COL_WIDTH = 95
 
-FREE_CELL_X = [10, 110, 210, 310]
-FOUNDATION_X = [472]
-SLOT_Y = 303
-SLOT_W, SLOT_H = 95, 90
+def _template_dir(name: str) -> str:
+    return str(Path(__file__).resolve().parent / name)
+
 
 def load_templates(folder):
     t = {}
@@ -30,10 +124,14 @@ def load_templates(folder):
         t[name] = binary
     return t
 
-TEMPLATES = load_templates("templates")
-TEMPLATES_LAST = load_templates("templates_last")
+
+TEMPLATES = load_templates(_template_dir("templates"))
+TEMPLATES_LAST = load_templates(_template_dir("templates_last"))
+
 
 def classify_suit_color(patch):
+    if patch.size == 0:
+        return "?"
     gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
     mask = gray < 200
     if mask.sum() < 5:
@@ -43,7 +141,10 @@ def classify_suit_color(patch):
         return "RED"
     return "BLACK"
 
+
 def match_rank(patch, template_set):
+    if patch.size == 0:
+        return "?", 0.0
     gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     padded = cv2.copyMakeBorder(binary, PAD, PAD, PAD, PAD, cv2.BORDER_CONSTANT, value=0)
@@ -59,107 +160,389 @@ def match_rank(patch, template_set):
             best_name = name
     return best_name, best_score
 
-def detect_column_height(img, x):
-    """Detect how tall the card stack in this column currently is, using
-    white-region contour detection (same approach as find_cards.py).
 
-    The white mask only picks up face-up (revealed) cards; face-down cards at
-    the top of a column render as a uniform ~30px sliver per card that the
-    mask doesn't see, so the revealed region's top edge sits that much lower
-    than the column origin. Returns (height, hidden_count, reliable):
-    - height: pixel bottom of the revealed region (unchanged meaning from
-      before hidden-card support)
-    - hidden_count: how many face-down cards sit above the revealed region,
-      inferred from that top offset
-    - reliable: False when the top offset doesn't cleanly fit a whole number
-      of hidden cards (~30px each) - a sign of a mid-animation render rather
-      than a real, stable hidden-card count
-    """
-    col_slice = img[TABLEAU_Y_TOP:, x:x+COL_WIDTH]
-    hsv = cv2.cvtColor(col_slice, cv2.COLOR_BGR2HSV)
-    lower_white = np.array([0, 0, 180])
-    upper_white = np.array([180, 60, 255])
-    mask = cv2.inRange(hsv, lower_white, upper_white)
+def default_transform_for_image(img: np.ndarray, layout: BoardLayout = REFERENCE_LAYOUT) -> BoardTransform:
+    h, w = img.shape[:2]
+    return BoardTransform(
+        original_width=w,
+        original_height=h,
+        content_x=0,
+        content_y=0,
+        content_width=w,
+        content_height=h,
+        reference_width=layout.reference_width,
+        reference_height=layout.reference_height,
+    )
 
-    kernel = np.ones((5,5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return 0, 0, True
+def transform_from_content_rect(
+    image_width: int,
+    image_height: int,
+    content_rect: tuple[float, float, float, float],
+    layout: BoardLayout = REFERENCE_LAYOUT,
+) -> BoardTransform:
+    x, y, w, h = content_rect
+    return BoardTransform(image_width, image_height, x, y, w, h, layout.reference_width, layout.reference_height)
 
-    max_y, min_y = 0, None
-    for c in contours:
-        cx, cy, cw, ch = cv2.boundingRect(c)
-        if cw > 30 and ch > 20:
-            max_y = max(max_y, cy + ch)
-            min_y = cy if min_y is None else min(min_y, cy)
 
-    if min_y is None:
-        return 0, 0, True
-
-    hidden_count = round(min_y / HIDDEN_CARD_H)
-    residual = abs(min_y - hidden_count * HIDDEN_CARD_H)
-    reliable = residual <= TOP_RESIDUAL_TOLERANCE
-    return max_y, hidden_count, reliable  # bottom pixel of the revealed region
-
-def read_board(frame_path):
-    img = cv2.imread(frame_path)
-    if img is None:
-        raise FileNotFoundError(frame_path)
-
-    board = {}
-    for col_idx, x in enumerate(TABLEAU_X):
-        height, hidden_count, reliable = detect_column_height(img, x)
-        col_cards = []
-
-        if height < 100:  # empty or noise, treat as empty column
-            board[f"col{col_idx}"] = col_cards
+def _find_stack_boxes(img: np.ndarray, layout: BoardLayout) -> list[dict[str, Any] | None]:
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    white = cv2.inRange(hsv, np.array([0, 0, 175]), np.array([180, 75, 255]))
+    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes_by_col: list[list[tuple[int, int, int, int]]] = [[] for _ in layout.tableau_x]
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w < layout.column_width * 0.35 or h < 25:
             continue
+        if y < layout.slot_y + layout.slot_height + 80:
+            continue
+        if y > int(layout.reference_height * 0.88):
+            continue
+        cx = x + w / 2
+        for idx, col_x in enumerate(layout.tableau_x):
+            if col_x - 18 <= cx <= col_x + layout.column_width + 18:
+                boxes_by_col[idx].append((x, y, w, h))
+                break
 
-        revealed_span = height - hidden_count * HIDDEN_CARD_H
-        num_rows = round((revealed_span - 135) / 50) + 1
-        num_rows = max(1, num_rows)
+    stack_boxes: list[dict[str, Any] | None] = []
+    for boxes in boxes_by_col:
+        if not boxes:
+            stack_boxes.append(None)
+            continue
+        x1 = min(b[0] for b in boxes)
+        y1 = min(b[1] for b in boxes)
+        x2 = max(b[0] + b[2] for b in boxes)
+        y2 = max(b[1] + b[3] for b in boxes)
+        stack_boxes.append({"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1, "bottom": y2})
+    return stack_boxes
 
-        # face-down cards have no readable rank; represent them as unknown
-        # rather than feeding their pixels into the rank matcher
-        col_cards.extend({"rank": "?", "color": "?", "score": 0.0} for _ in range(hidden_count))
 
-        y_start = TABLEAU_Y_TOP + hidden_count * HIDDEN_CARD_H
-        for row in range(num_rows):
-            y = y_start + row * STEP
-            is_last = (row == num_rows - 1)
+def _has_card_back_near_top(img: np.ndarray, box: dict[str, Any], layout: BoardLayout) -> bool:
+    x1 = max(0, int(box["x"]))
+    x2 = min(img.shape[1], int(box["x"] + box["w"]))
+    y1 = max(0, int(box["y"]))
+    y2 = min(img.shape[0], int(box["y"] + min(42, box["h"])))
+    patch = img[y1:y2, x1:x2]
+    if patch.size == 0:
+        return False
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    saturated = cv2.inRange(hsv, np.array([95, 45, 45]), np.array([155, 255, 255]))
+    return saturated.mean() > 12
 
-            if is_last:
-                rank_patch = img[y:y+90, x:x+95]
-                name, score = match_rank(rank_patch, TEMPLATES_LAST)
-                color = classify_suit_color(img[y+20:y+40, x+55:x+90])
-            else:
-                rank_patch = img[y:y+RANK_H, x:x+RANK_W]
-                name, score = match_rank(rank_patch, TEMPLATES)
-                suit_patch = img[y+SUIT_Y_OFF:y+SUIT_Y_OFF+SUIT_H, x+SUIT_X_OFF:x+SUIT_X_OFF+SUIT_W]
-                color = classify_suit_color(suit_patch)
 
-            # a top offset that doesn't cleanly fit a whole number of hidden
-            # cards means this frame is mid-animation, not a stable state -
-            # every row crop here is misaligned regardless of match_rank's score
-            if not reliable:
-                score = 0.0
+def _estimate_hidden_step(stack_boxes: list[dict[str, Any] | None], img: np.ndarray, layout: BoardLayout) -> int:
+    boxes = [b for b in stack_boxes if b]
+    if not boxes:
+        return layout.hidden_card_step
+    top = min(b["y"] for b in boxes)
+    offsets = sorted(
+        int(round(b["y"] - top))
+        for b in boxes
+        if 12 <= b["y"] - top <= 160 and _has_card_back_near_top(img, b, layout)
+    )
+    diffs = [b - a for a, b in zip(offsets, offsets[1:]) if 12 <= b - a <= 45]
+    if diffs:
+        return int(round(float(np.median(diffs))))
+    back_heights = sorted(
+        int(round(b["h"]))
+        for b in boxes
+        if _has_card_back_near_top(img, b, layout) and b["h"] >= layout.full_card_height
+    )
+    height_diffs = [b - a for a, b in zip(back_heights, back_heights[1:]) if 12 <= b - a <= 45]
+    if height_diffs:
+        return int(round(float(np.median(height_diffs))))
+    return layout.hidden_card_step
 
-            col_cards.append({"rank": name, "color": color, "score": round(float(score), 2)})
 
-        board[f"col{col_idx}"] = col_cards
+def _safe_crop(img: np.ndarray, x: int, y: int, w: int, h: int) -> np.ndarray:
+    if x < 0 or y < 0 or x + w > img.shape[1] or y + h > img.shape[0]:
+        return np.zeros((0, 0, 3), dtype=np.uint8)
+    return img[y:y + h, x:x + w]
+
+
+def _scan_rows_for_column(
+    img: np.ndarray,
+    col_idx: int,
+    box: dict[str, Any] | None,
+    board_bottom: int,
+    layout: BoardLayout,
+    hidden_step: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    report = {"column": col_idx, "box": box, "rows": [], "rejections": []}
+    if not box or box["h"] < 80:
+        return [], report
+
+    global_top_candidates = [b["y"] for b in _find_stack_boxes(img, layout) if b]
+    global_top = min(global_top_candidates) if global_top_candidates else layout.tableau_y_top
+    x = int(round(layout.tableau_x[col_idx]))
+    height = int(round(box["h"]))
+    y_box = int(round(box["y"]))
+    has_back = _has_card_back_near_top(img, box, layout)
+    top_offset = max(0, int(round(y_box - global_top)))
+
+    if top_offset > hidden_step / 2:
+        hidden_count = int(round(top_offset / hidden_step))
+        revealed_count = max(1, int(round((height - layout.full_card_height) / layout.revealed_card_step)) + 1)
+        first_revealed_y = y_box
+    elif has_back:
+        hidden_count = max(1, int(round(max(0, height - layout.full_card_height) / max(1, hidden_step))))
+        revealed_count = 1
+        first_revealed_y = int(round(box["bottom"] - layout.full_card_height))
+    else:
+        hidden_count = 0
+        revealed_count = max(1, int(round((height - layout.full_card_height) / layout.revealed_card_step)) + 1)
+        first_revealed_y = y_box
+
+    total = hidden_count + revealed_count
+    if total > layout.max_tableau_cards:
+        report["rejections"].append({"reason": "max_card_count", "count": total})
+        return [], report
+
+    cards: list[dict[str, Any]] = []
+    row_positions: list[int] = []
+    for idx in range(hidden_count):
+        y = int(round(y_box + idx * hidden_step)) if has_back and top_offset <= hidden_step / 2 else int(round(global_top + idx * hidden_step))
+        row_positions.append(y)
+        cards.append({"rank": "?", "color": "?", "score": 0.0})
+        report["rows"].append({"kind": "hidden", "y": y})
+
+    for row in range(revealed_count):
+        y = int(round(first_revealed_y + row * layout.revealed_card_step))
+        if y + layout.full_card_height > board_bottom:
+            report["rejections"].append({"reason": "row_leaves_board", "y": y})
+            break
+        if row_positions and y <= row_positions[-1]:
+            report["rejections"].append({"reason": "non_monotonic_row", "y": y})
+            break
+        if row_positions and abs(y - row_positions[-1]) < 10:
+            report["rejections"].append({"reason": "repeated_card_position", "y": y})
+            break
+        is_last = row == revealed_count - 1
+        if is_last:
+            rank_patch = _safe_crop(img, x, y, layout.last_card_crop_width, layout.last_card_crop_height)
+            name, score = match_rank(rank_patch, TEMPLATES_LAST)
+            color_patch = _safe_crop(img, x + 55, y + 20, 35, 20)
+            color = classify_suit_color(color_patch)
+        else:
+            rank_patch = _safe_crop(img, x, y, layout.rank_width, layout.rank_height)
+            name, score = match_rank(rank_patch, TEMPLATES)
+            suit_patch = _safe_crop(img, x + layout.suit_x_offset, y + layout.suit_y_offset, layout.suit_width, layout.suit_height)
+            color = classify_suit_color(suit_patch)
+        if score < layout.min_rank_score:
+            report["rejections"].append({"reason": "low_confidence_rank", "y": y, "rank": name, "score": float(score)})
+            name, color, score = "?", "?", 0.0
+        row_positions.append(y)
+        card = {"rank": name, "color": color, "score": round(float(score), 2)}
+        cards.append(card)
+        report["rows"].append({"kind": "revealed", "y": y, "rank": name, "color": color, "score": round(float(score), 3)})
+
+    if any(b <= a for a, b in zip(row_positions, row_positions[1:])):
+        report["rejections"].append({"reason": "non_monotonic_rows", "rows": row_positions})
+        return [], report
+    return cards, report
+
+
+def _detect_board_bottom(img: np.ndarray, layout: BoardLayout) -> int:
+    # Stop before bottom controls/footers when they are visible. This is a guard
+    # for scanning, not a coordinate transform.
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    green = cv2.inRange(hsv, np.array([35, 35, 20]), np.array([95, 255, 230]))
+    row_fraction = green.mean(axis=1) / 255.0
+    for y in range(img.shape[0] - 1, layout.tableau_y_top + 300, -1):
+        if row_fraction[y] > 0.45:
+            return min(img.shape[0], y + 1)
+    return img.shape[0]
+
+
+def _reject_impossible_multiplicities(board: dict[str, Any], report: dict[str, Any]) -> None:
+    counts: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for area in [f"col{i}" for i in range(7)] + ["free_cells", "foundation"]:
+        cards = board.get(area, [])
+        for idx, card in enumerate(cards):
+            if not card or card.get("rank") == "?" or card.get("color") == "?":
+                continue
+            key = (card["rank"], card["color"])
+            counts.setdefault(key, []).append({"area": area, "index": idx})
+    for (rank, color), positions in counts.items():
+        if len(positions) > 2:
+            keep = sorted(
+                positions,
+                key=lambda pos: board[pos["area"]][pos["index"]].get("score", 0.0),
+                reverse=True,
+            )[:2]
+            keep_ids = {(pos["area"], pos["index"]) for pos in keep}
+            report.setdefault("multiplicity_rejections", []).append({
+                "rank": rank,
+                "color": color,
+                "positions": positions,
+                "kept": keep,
+            })
+            for pos in positions:
+                if (pos["area"], pos["index"]) in keep_ids:
+                    continue
+                card = board[pos["area"]][pos["index"]]
+                card["rank"] = "?"
+                card["color"] = "?"
+                card["score"] = 0.0
+
+
+def _detect_slot_y(img: np.ndarray, layout: BoardLayout, tableau_top: int) -> int:
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    white = cv2.inRange(hsv, np.array([0, 0, 175]), np.array([180, 75, 255]))
+    back = cv2.inRange(hsv, np.array([95, 45, 45]), np.array([155, 255, 255]))
+    mask = cv2.bitwise_or(white, back)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if 180 <= y < tableau_top - 55 and w >= 45 and h >= 45:
+            candidates.append(y)
+    return min(candidates) if candidates else layout.slot_y
+
+
+def detect_column_height(img, x):
+    layout = REFERENCE_LAYOUT
+    boxes = _find_stack_boxes(img, layout)
+    for idx, col_x in enumerate(layout.tableau_x):
+        if abs(col_x - x) < 4 and boxes[idx]:
+            box = boxes[idx]
+            hidden_step = _estimate_hidden_step(boxes, img, layout)
+            hidden_count = 0
+            if _has_card_back_near_top(img, box, layout):
+                hidden_count = max(0, int(round(max(0, box["h"] - layout.full_card_height) / max(1, hidden_step))))
+            return int(box["h"]), hidden_count, True
+    return 0, 0, True
+
+
+def _load_image(image_or_path: str | Path | np.ndarray) -> np.ndarray:
+    if isinstance(image_or_path, np.ndarray):
+        return image_or_path
+    img = cv2.imread(str(image_or_path))
+    if img is None:
+        raise FileNotFoundError(image_or_path)
+    return img
+
+
+def read_board(
+    image_or_path,
+    layout: BoardLayout | None = None,
+    *,
+    transform: BoardTransform | None = None,
+    include_metadata: bool = False,
+):
+    layout = layout or REFERENCE_LAYOUT
+    original = _load_image(image_or_path)
+    transform = transform or default_transform_for_image(original, layout)
+    img = transform.normalize_image(original)
+    stack_boxes = _find_stack_boxes(img, layout)
+    hidden_step = _estimate_hidden_step(stack_boxes, img, layout)
+    tableau_tops = [b["y"] for b in stack_boxes if b]
+    tableau_top = int(round(min(tableau_tops))) if tableau_tops else layout.tableau_y_top
+    slot_y = _detect_slot_y(img, layout, tableau_top)
+    calibrated_layout = replace(layout, hidden_card_step=hidden_step, tableau_y_top=tableau_top, slot_y=slot_y)
+    board_bottom = _detect_board_bottom(img, calibrated_layout)
+
+    board: dict[str, Any] = {}
+    detection_report: dict[str, Any] = {
+        "board_bottom": board_bottom,
+        "hidden_card_step": hidden_step,
+        "stack_boxes": stack_boxes,
+        "columns": [],
+    }
+    for col_idx, box in enumerate(stack_boxes):
+        cards, report = _scan_rows_for_column(img, col_idx, box, board_bottom, calibrated_layout, hidden_step)
+        board[f"col{col_idx}"] = cards
+        detection_report["columns"].append(report)
 
     def read_slot(x):
-        patch = img[SLOT_Y:SLOT_Y+SLOT_H, x:x+SLOT_W]
+        patch = _safe_crop(img, x, calibrated_layout.slot_y, calibrated_layout.slot_width, calibrated_layout.slot_height)
+        if patch.size == 0:
+            return None
         gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
         if gray.std() < 15:
             return None
         name, score = match_rank(patch, TEMPLATES_LAST)
-        color = classify_suit_color(img[SLOT_Y+20:SLOT_Y+40, x+55:x+90])
+        if score < calibrated_layout.min_rank_score:
+            return None
+        color = classify_suit_color(_safe_crop(img, x + 55, calibrated_layout.slot_y + 20, 35, 20))
         return {"rank": name, "color": color, "score": round(float(score), 2)}
 
-    board["free_cells"] = [read_slot(x) for x in FREE_CELL_X]
-    board["foundation"] = [read_slot(x) for x in FOUNDATION_X]
+    board["free_cells"] = [read_slot(x) for x in calibrated_layout.free_cell_x]
+    board["foundation"] = [read_slot(x) for x in calibrated_layout.foundation_x]
+    _reject_impossible_multiplicities(board, detection_report)
 
+    if include_metadata:
+        return {
+            "board": board,
+            "layout": calibrated_layout,
+            "transform": transform,
+            "normalized_image": img,
+            "detection_report": detection_report,
+        }
     return board
+
+
+def save_calibration_artifacts(image_or_path, calibration_dir, layout: BoardLayout | None = None) -> dict[str, Any]:
+    layout = layout or REFERENCE_LAYOUT
+    original = _load_image(image_or_path)
+    result = read_board(original, layout=layout, include_metadata=True)
+    out = Path(calibration_dir)
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out / "original.png"), original)
+    normalized = result["normalized_image"]
+    cv2.imwrite(str(out / "normalized.png"), normalized)
+
+    overlay = normalized.copy()
+    transform: BoardTransform = result["transform"]
+    detection = result["detection_report"]
+    board_bottom = detection["board_bottom"]
+    cv2.rectangle(overlay, (0, 0), (layout.reference_width - 1, board_bottom - 1), (0, 255, 255), 2)
+    cv2.putText(overlay, "content rect original=(%.1f,%.1f %.1fx%.1f) normalized=(0,0 %dx%d)" % (
+        transform.content_x, transform.content_y, transform.content_width, transform.content_height,
+        layout.reference_width, layout.reference_height,
+    ), (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+    for idx, x in enumerate(layout.tableau_x):
+        cv2.rectangle(overlay, (x, layout.tableau_y_top), (x + layout.column_width, board_bottom), (255, 200, 0), 1)
+        cv2.putText(overlay, f"col{idx}", (x + 4, layout.tableau_y_top - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 1)
+        col_dir = out / "tableau_crops"
+        col_dir.mkdir(exist_ok=True)
+        cv2.imwrite(str(col_dir / f"col{idx}.png"), normalized[layout.tableau_y_top:board_bottom, x:x + layout.column_width])
+
+    rank_dir = out / "rank_crops"
+    rank_dir.mkdir(exist_ok=True)
+    for col in detection["columns"]:
+        box = col.get("box")
+        if box:
+            cv2.circle(overlay, (int(box["x"] + box["w"] / 2), int(box["y"])), 5, (0, 255, 0), -1)
+            cv2.circle(overlay, (int(box["x"] + box["w"] / 2), int(box["bottom"])), 5, (0, 0, 255), -1)
+        for row_idx, row in enumerate(col["rows"]):
+            y = int(row["y"])
+            x = layout.tableau_x[col["column"]]
+            cv2.line(overlay, (x, y), (x + layout.column_width, y), (0, 128, 255), 2)
+            cv2.putText(overlay, f"c{col['column']} r{row_idx} {row['kind']} y={y}", (x + 2, y + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 128, 255), 1)
+            cv2.imwrite(str(rank_dir / f"col{col['column']}_row{row_idx}_{row['kind']}.png"),
+                        _safe_crop(normalized, x, y, layout.last_card_crop_width, layout.last_card_crop_height))
+
+    for name, xs in (("free_cell", layout.free_cell_x), ("foundation", layout.foundation_x)):
+        crop_dir = out / f"{name}_crops"
+        crop_dir.mkdir(exist_ok=True)
+        for idx, x in enumerate(xs):
+            cv2.rectangle(overlay, (x, layout.slot_y), (x + layout.slot_width, layout.slot_y + layout.slot_height), (255, 0, 255), 2)
+            cv2.putText(overlay, f"{name}{idx}", (x + 2, layout.slot_y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+            cv2.imwrite(str(crop_dir / f"{idx}.png"), _safe_crop(normalized, x, layout.slot_y, layout.slot_width, layout.slot_height))
+
+    cv2.imwrite(str(out / "layout_overlay.png"), overlay)
+    (out / "layout.json").write_text(json.dumps(result["layout"].to_json_data(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    detection_payload = {
+        **result["detection_report"],
+        "transform": result["transform"].to_json_data(),
+        "board": result["board"],
+    }
+    (out / "detection_report.json").write_text(json.dumps(detection_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return detection_payload
