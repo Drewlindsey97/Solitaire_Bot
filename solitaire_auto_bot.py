@@ -263,6 +263,12 @@ def main():
         help="Seconds to wait after a batch of moves for the UI to settle before the next "
              "screen capture. Default: 1.5.",
     )
+    parser.add_argument(
+        "--solver",
+        choices=["search", "monte-carlo"],
+        default="search",
+        help="Choose the move-selection engine. Default: search."
+    )
     args = parser.parse_args()
 
     sim_mode = args.sim is not None
@@ -365,20 +371,20 @@ def main():
             print("[*] Searching for a path...")
             path, explored, solved = solve(cols, initial_free=free, initial_found=found, time_limit=5.0)
 
-        if path:
-            batch = path if args.moves_per_cycle <= 0 else path[:args.moves_per_cycle]
-            print(f"[*] Executing {len(batch)} move(s) this cycle:")
-            for idx, mv in enumerate(batch):
-                print(f"  {idx+1}. {mv}")
-                ok = execute_move(board, mv, sim_mode=sim_mode)
-                if not ok:
-                    print("[*] Stopping batch early; will re-read the board next cycle.")
-                    break
-                # Keep our local board model in sync so the next move's
-                # coordinates can be computed without re-reading the screen.
-                apply_move_to_board(board, mv)
-        else:
-            print("[*] No moves found. Board might already be solved or no path exists.")
+            if path:
+                batch = path if args.moves_per_cycle <= 0 else path[:args.moves_per_cycle]
+                print(f"[*] Executing {len(batch)} move(s) this cycle:")
+                for idx, mv in enumerate(batch):
+                    print(f"  {idx+1}. {mv}")
+                    ok = execute_move(board, mv, sim_mode=sim_mode)
+                    if not ok:
+                        print("[*] Stopping batch early; will re-read the board next cycle.")
+                        break
+                    # Keep our local board model in sync so the next move's
+                    # coordinates can be computed without re-reading the screen.
+                    apply_move_to_board(board, mv)
+            else:
+                print("[*] No moves found. Board might already be solved or no path exists.")
 
         if sim_mode:
             # Only run once in simulation mode
