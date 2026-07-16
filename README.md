@@ -54,3 +54,102 @@ To run the bot live on a connected device:
 python3 solitaire_auto_bot.py
 ```
 This will loop continuously: capture screen -> analyze state -> compute moves -> execute gesture -> wait for UI update.
+
+---
+
+## Session Logging and Android Logcat
+
+Solvitaire can now write two complementary logs:
+
+- A structured JSONL session log containing OCR timing, unresolved-card counts, solver timing, Monte Carlo statistics, selected moves, and gesture coordinates.
+- A raw Android `logcat` capture for diagnosing app, input, rendering, and device-side behavior.
+
+### Structured logging only
+
+```bash
+python3 solitaire_auto_bot.py \
+  --sim Gameplay/frame_0108.png \
+  --solver monte-carlo \
+  --log-file logs/test_session.jsonl
+```
+
+Each line in the JSONL file is a complete JSON object, making the file easy to inspect with `jq`, Python, or a spreadsheet import.
+
+Example:
+
+```bash
+jq . logs/test_session.jsonl | less
+```
+
+### Find the Android package name
+
+Open the game on the connected Android device, then try:
+
+```bash
+adb shell dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'
+```
+
+Or search installed package names:
+
+```bash
+adb shell pm list packages | grep -i solitaire
+```
+
+The package name will look similar to `com.example.solitaire`.
+
+### Live bot with logcat
+
+```bash
+python3 solitaire_auto_bot.py \
+  --solver monte-carlo \
+  --logcat \
+  --clear-logcat \
+  --logcat-package com.example.solitaire
+```
+
+When `--logcat` is enabled, Solvitaire automatically creates:
+
+```text
+logs/session_YYYYMMDD_HHMMSS.jsonl
+logs/logcat_YYYYMMDD_HHMMSS.log
+```
+
+Use explicit paths when preferred:
+
+```bash
+python3 solitaire_auto_bot.py \
+  --solver search \
+  --logcat \
+  --log-file logs/my_session.jsonl \
+  --logcat-file logs/my_android.log
+```
+
+Restrict the raw capture with one or more regular-expression filters:
+
+```bash
+python3 solitaire_auto_bot.py \
+  --logcat \
+  --logcat-filter 'InputDispatcher|InputReader' \
+  --logcat-filter 'solitaire|card|move'
+```
+
+Package filtering uses the app's current process ID when it can be resolved. If the package is not running or Android cannot provide a PID, Solvitaire falls back to capturing the available logcat stream rather than silently producing no diagnostics.
+
+### Capture logcat without running the bot
+
+```bash
+python3 logcat_monitor.py \
+  --clear \
+  --package com.example.solitaire \
+  --output logs/manual_logcat.log
+```
+
+Stop it with `Ctrl+C`, or capture for a fixed number of seconds:
+
+```bash
+python3 logcat_monitor.py \
+  --duration 20 \
+  --output logs/manual_logcat.log
+```
+
+Android applications do not always emit useful game-specific messages. Even when the app is quiet, system tags such as input dispatch, activity lifecycle, crashes, and rendering warnings may still help diagnose failed gestures or UI timing issues.

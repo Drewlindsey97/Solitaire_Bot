@@ -3,6 +3,8 @@ import time
 import sys
 import os
 import argparse
+from datetime import datetime
+from pathlib import Path
 from board_reader_lib import (
     read_board, TABLEAU_X, TABLEAU_Y_TOP, COL_WIDTH,
     FREE_CELL_X, FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
@@ -14,6 +16,9 @@ from monte_carlo_solver import (
     choose_move_monte_carlo,
     print_statistics,
 )
+
+from logcat_monitor import LogcatMonitor, default_logcat_path
+from session_logger import SessionLogger, default_session_log_path
 
 import bridge
 
@@ -147,11 +152,13 @@ def apply_move_to_board(board, move):
 # ==============================================================================
 # 3. MOVE TRANSLATION TO PHYSICAL GESTURES
 # ==============================================================================
-def execute_move(board, move, sim_mode=False):
+def execute_move(board, move, sim_mode=False, event_logger=None):
     """
     Translates a solver move into coordinates and triggers the swipe/tap.
     """
     kind = move[0]
+    card = move[-1]
+    emit = event_logger or (lambda event_name, **data: None)
     start_coords = None
     end_coords = None
 
@@ -214,31 +221,71 @@ def execute_move(board, move, sim_mode=False):
             print(f"[Warn] Skipping move {move}: physical top of col{ci} "
                   f"({top}) does not match solver's expected card {card}. "
                   f"Board read is stale or ambiguous; will re-read next cycle.")
+            emit(
+                "move_rejected",
+                move=move,
+                reason="physical_top_mismatch",
+                physical_top=top,
+                expected_card=card,
+            )
             return False
 
     if start_coords and end_coords:
         x1, y1 = start_coords
         x2, y2 = end_coords
         if kind in ("col_to_found", "free_to_found"):
-            print(f"[*] Action: Tap to Foundation: {move[2] if len(move) > 2 else card} at ({x1}, {y1})")
+            print(f"[*] Action: Tap to Foundation: {card} at ({x1}, {y1})")
+            emit(
+                "gesture_planned",
+                move=move,
+                gesture="tap",
+                start={"x": x1, "y": y1},
+                simulation=sim_mode,
+            )
             if sim_mode:
                 print(f"   [Simulation] Would tap: bridge.tap({x1}, {y1})")
             else:
                 bridge.tap(x1, y1)
         else:
-            print(f"[*] Action: Move {kind.replace('_', ' ')}: {move[2] if len(move) > 2 else card} from ({x1}, {y1}) to ({x2}, {y2})")
+            print(
+                f"[*] Action: Move {kind.replace('_', ' ')}: {card} "
+                f"from ({x1}, {y1}) to ({x2}, {y2})"
+            )
+            emit(
+                "gesture_planned",
+                move=move,
+                gesture="swipe",
+                start={"x": x1, "y": y1},
+                end={"x": x2, "y": y2},
+                simulation=sim_mode,
+            )
             if sim_mode:
                 print(f"   [Simulation] Would swipe: bridge.swipe({x1}, {y1}, {x2}, {y2})")
             else:
                 bridge.swipe(x1, y1, x2, y2)
+        emit("gesture_dispatched", move=move, simulation=sim_mode)
         return True
     else:
         print(f"[Error] Failed to resolve coordinates for move: {move}")
+        emit("move_rejected", move=move, reason="coordinate_resolution_failed")
         return False
 
 # ==============================================================================
 # 4. MAIN LOOP
 # ==============================================================================
+def count_unresolved_cards(board):
+    unresolved = 0
+    for idx in range(7):
+        for card in board.get(f"col{idx}", []):
+            if card and (card.get("rank") == "?" or card.get("color") == "?"):
+                unresolved += 1
+    for area in ("free_cells", "foundation"):
+        for card in board.get(area, []):
+            if card and (card.get("rank") == "?" or card.get("color") == "?"):
+                unresolved += 1
+    return unresolved
+
+
 def main():
     parser = argparse.ArgumentParser(description="Automated Solitaire Stash Bot")
     parser.add_argument(
@@ -269,130 +316,337 @@ def main():
         default="search",
         help="Choose the move-selection engine. Default: search."
     )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        help="Write structured Solvitaire events as JSONL to this file."
+    )
+    parser.add_argument(
+        "--logcat",
+        action="store_true",
+        help="Capture Android logcat in the background for this session."
+    )
+    parser.add_argument(
+        "--logcat-file",
+        type=str,
+        help="Raw logcat output file. Default: logs/logcat_<timestamp>.log."
+    )
+    parser.add_argument(
+        "--logcat-package",
+        type=str,
+        help="Android package to restrict logcat by process ID, when the app is running."
+    )
+    parser.add_argument(
+        "--logcat-filter",
+        action="append",
+        default=[],
+        help="Regex for logcat lines to keep. Repeat the option to add more filters."
+    )
+    parser.add_argument(
+        "--clear-logcat",
+        action="store_true",
+        help="Clear the Android log buffer before capture starts."
+    )
     args = parser.parse_args()
 
     sim_mode = args.sim is not None
     screenshot_file = args.sim if sim_mode else "live_screen.png"
 
+    # Enabling logcat also enables a structured session log unless the user
+    # already supplied an explicit JSONL path.
+    session_log_path = Path(args.log_file) if args.log_file else None
+    if args.logcat and session_log_path is None:
+        session_log_path = default_session_log_path()
+
+    session_logger = SessionLogger(session_log_path) if session_log_path else None
+
+    def log_event(event_name, **data):
+        if session_logger is not None:
+            session_logger.event(event_name, **data)
+
+    logcat_monitor = None
+    logcat_path = None
+    if args.logcat:
+        logcat_path = Path(args.logcat_file) if args.logcat_file else default_logcat_path()
+        logcat_monitor = LogcatMonitor(
+            output_path=logcat_path,
+            run_mode=bridge.RUN_MODE,
+            package=args.logcat_package,
+            include_patterns=args.logcat_filter,
+            clear_first=args.clear_logcat,
+        )
+
     if sim_mode:
         print(f"[*] Running in SIMULATION mode on file: {screenshot_file}")
         if not os.path.exists(screenshot_file):
             print(f"[Error] Simulation file '{screenshot_file}' does not exist.", file=sys.stderr)
+            if session_logger is not None:
+                session_logger.close()
             sys.exit(1)
     else:
         print(f"[*] Running in LIVE device mode (RUN_MODE: {bridge.RUN_MODE})")
 
-    # Run loop
-    while True:
-        if not sim_mode:
-            print("[*] Capturing screen...")
-            img = bridge.screenshot()
-            if img:
-                img.save(screenshot_file)
-                print(f"[*] Screen saved to {screenshot_file}")
+    cycle_number = 0
+    interrupted = False
+    logcat_started = False
+
+    try:
+        if logcat_monitor is not None:
+            if logcat_monitor.start():
+                logcat_started = True
+                pid_text = ", ".join(logcat_monitor.resolved_pids) or "all processes"
+                print(f"[*] Logcat capture started: {logcat_path} ({pid_text})")
+                log_event(
+                    "logcat_started",
+                    path=logcat_path,
+                    package=args.logcat_package,
+                    pids=logcat_monitor.resolved_pids,
+                    filters=args.logcat_filter,
+                )
             else:
-                print("[Error] Failed to capture screenshot. Retrying in 3 seconds...")
+                print(f"[Warn] Logcat capture could not start: {logcat_monitor.error}")
+                log_event("logcat_start_failed", error=logcat_monitor.error)
+
+        log_event(
+            "session_started",
+            mode="simulation" if sim_mode else "live",
+            solver=args.solver,
+            screenshot=screenshot_file,
+            run_mode=bridge.RUN_MODE,
+            moves_per_cycle=args.moves_per_cycle,
+            interval_seconds=args.interval,
+            started_local=datetime.now().isoformat(),
+        )
+
+        while True:
+            cycle_number += 1
+            cycle_started = time.perf_counter()
+            log_event("cycle_started", cycle=cycle_number)
+
+            if not sim_mode:
+                print("[*] Capturing screen...")
+                capture_started = time.perf_counter()
+                img = bridge.screenshot()
+                capture_seconds = time.perf_counter() - capture_started
+
+                if img:
+                    img.save(screenshot_file)
+                    print(f"[*] Screen saved to {screenshot_file}")
+                    log_event(
+                        "screenshot_captured",
+                        cycle=cycle_number,
+                        path=screenshot_file,
+                        duration_seconds=capture_seconds,
+                    )
+                else:
+                    print("[Error] Failed to capture screenshot. Retrying in 3 seconds...")
+                    log_event(
+                        "screenshot_failed",
+                        cycle=cycle_number,
+                        duration_seconds=capture_seconds,
+                    )
+                    time.sleep(3.0)
+                    continue
+
+            print("[*] Analyzing board state...")
+            board_started = time.perf_counter()
+            try:
+                board = read_board(screenshot_file)
+            except Exception as exc:
+                board_seconds = time.perf_counter() - board_started
+                print(f"[Error] Failed to read board: {exc}")
+                log_event(
+                    "board_read_failed",
+                    cycle=cycle_number,
+                    error=str(exc),
+                    duration_seconds=board_seconds,
+                )
+                if sim_mode:
+                    break
                 time.sleep(3.0)
                 continue
 
-        print("[*] Analyzing board state...")
-        try:
-            board = read_board(screenshot_file)
-        except Exception as e:
-            print(f"[Error] Failed to read board: {e}")
+            board_seconds = time.perf_counter() - board_started
+            unresolved_cards = count_unresolved_cards(board)
+            log_event(
+                "board_read",
+                cycle=cycle_number,
+                duration_seconds=board_seconds,
+                unresolved_cards=unresolved_cards,
+                board=board,
+            )
+
+            print("[*] Board Cards Detected:")
+            for idx in range(7):
+                col_key = f"col{idx}"
+                col_info = [f"{c['rank']}({c['color']})" for c in board[col_key]]
+                print(f"  col{idx}: {col_info}")
+
+            free_info = [f"{c['rank']}({c['color']})" if c else "None" for c in board["free_cells"]]
+            found_info = [f"{c['rank']}({c['color']})" if c else "None" for c in board["foundation"]]
+            print(f"  free_cells: {free_info}")
+            print(f"  foundation: {found_info}")
+
+            assign_pseudo_suits(board)
+
+            cols = []
+            truncated_columns = []
+            for idx in range(7):
+                col = []
+                for card in board[f"col{idx}"]:
+                    if card and card.get("rank") == "?" and card.get("color") == "?":
+                        continue
+                    if card and "suit" in card:
+                        col.append((card["rank"], card["suit"]))
+                    else:
+                        print(f"[Warn] col{idx}: unresolved card {card!r}; truncating column read here")
+                        truncated_columns.append(idx)
+                        break
+                cols.append(col)
+
+            free = []
+            for card in board["free_cells"]:
+                if card and "suit" in card:
+                    free.append((card["rank"], card["suit"]))
+
+            found = {}
+            for card in board["foundation"]:
+                if card and "suit" in card:
+                    found[card["suit"]] = rank_val(card["rank"])
+
+            print("[*] Formulated Solver State:")
+            print(f"  Cols: {cols}")
+            print(f"  Free: {free}")
+            print(f"  Found: {found}")
+            log_event(
+                "solver_state_built",
+                cycle=cycle_number,
+                columns=cols,
+                free=free,
+                foundations=found,
+                truncated_columns=truncated_columns,
+            )
+
+            if args.solver == "monte-carlo":
+                print("[*] Running Monte Carlo move search...")
+                solver_started = time.perf_counter()
+                state = State(cols, free, found)
+                move, statistics = choose_move_monte_carlo(state)
+                solver_seconds = time.perf_counter() - solver_started
+                print_statistics(statistics)
+
+                stats_payload = [
+                    {
+                        "move": stats.move,
+                        "visits": stats.visits,
+                        "wins": stats.wins,
+                        "win_rate": stats.win_rate,
+                        "average_score": stats.average_score,
+                    }
+                    for stats in statistics
+                ]
+                log_event(
+                    "solver_finished",
+                    cycle=cycle_number,
+                    solver="monte-carlo",
+                    duration_seconds=solver_seconds,
+                    selected_move=move,
+                    statistics=stats_payload,
+                    simulations_completed=sum(stats.visits for stats in statistics),
+                )
+
+                if move:
+                    ok = execute_move(
+                        board,
+                        move,
+                        sim_mode=sim_mode,
+                        event_logger=log_event,
+                    )
+                    log_event(
+                        "move_result",
+                        cycle=cycle_number,
+                        move=move,
+                        success=ok,
+                    )
+                else:
+                    print("[*] No moves found. Board might already be solved or no path exists.")
+                    log_event("no_move_selected", cycle=cycle_number, solver="monte-carlo")
+            else:
+                print("[*] Searching for a path...")
+                solver_started = time.perf_counter()
+                path, explored, solved = solve(
+                    cols,
+                    initial_free=free,
+                    initial_found=found,
+                    time_limit=5.0,
+                )
+                solver_seconds = time.perf_counter() - solver_started
+                log_event(
+                    "solver_finished",
+                    cycle=cycle_number,
+                    solver="search",
+                    duration_seconds=solver_seconds,
+                    explored_states=explored,
+                    solved=solved,
+                    path_length=len(path),
+                    path=path,
+                )
+
+                if path:
+                    batch = path if args.moves_per_cycle <= 0 else path[:args.moves_per_cycle]
+                    print(f"[*] Executing {len(batch)} move(s) this cycle:")
+                    for idx, move in enumerate(batch):
+                        print(f"  {idx + 1}. {move}")
+                        ok = execute_move(
+                            board,
+                            move,
+                            sim_mode=sim_mode,
+                            event_logger=log_event,
+                        )
+                        log_event(
+                            "move_result",
+                            cycle=cycle_number,
+                            batch_index=idx,
+                            move=move,
+                            success=ok,
+                        )
+                        if not ok:
+                            print("[*] Stopping batch early; will re-read the board next cycle.")
+                            break
+                        apply_move_to_board(board, move)
+                else:
+                    print("[*] No moves found. Board might already be solved or no path exists.")
+                    log_event("no_move_selected", cycle=cycle_number, solver="search")
+
+            cycle_seconds = time.perf_counter() - cycle_started
+            log_event("cycle_finished", cycle=cycle_number, duration_seconds=cycle_seconds)
+
             if sim_mode:
                 break
-            time.sleep(3.0)
-            continue
 
-        # Print confidence or contents
-        print("[*] Board Cards Detected:")
-        for idx in range(7):
-            col_key = f"col{idx}"
-            col_info = [f"{c['rank']}({c['color']})" for c in board[col_key]]
-            print(f"  col{idx}: {col_info}")
-        
-        free_info = [f"{c['rank']}({c['color']})" if c else "None" for c in board["free_cells"]]
-        found_info = [f"{c['rank']}({c['color']})" if c else "None" for c in board["foundation"]]
-        print(f"  free_cells: {free_info}")
-        print(f"  foundation: {found_info}")
+            print(f"[*] Waiting for UI update ({args.interval}s)...")
+            time.sleep(args.interval)
 
-        # Resolve pseudo-suits
-        assign_pseudo_suits(board)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n[*] Interrupted by user. Shutting down cleanly...")
+        log_event("session_interrupted", cycle=cycle_number)
+    finally:
+        if logcat_monitor is not None:
+            logcat_monitor.stop()
+            if logcat_started:
+                log_event("logcat_stopped", path=logcat_path)
+        log_event(
+            "session_finished",
+            cycles=cycle_number,
+            interrupted=interrupted,
+        )
+        if session_logger is not None:
+            print(f"[*] Structured session log: {session_logger.path}")
+            session_logger.close()
+        if logcat_started and logcat_path is not None:
+            print(f"[*] Raw logcat file: {logcat_path}")
 
-        # Formulate initial solver inputs
-        cols = []
-        for idx in range(7):
-            col = []
-            for c in board[f"col{idx}"]:
-                if c and c.get("rank") == "?" and c.get("color") == "?":
-                    # genuinely face-down card, always a leading run - not part
-                    # of the playable stack yet, safe to skip
-                    continue
-                if c and "suit" in c:
-                    col.append((c["rank"], c["suit"]))
-                else:
-                    # revealed card but rank/suit couldn't be resolved - we
-                    # can't trust our read of this card or anything above it
-                    # in the stack, so stop here instead of silently
-                    # continuing past it (which would shift the rest of the
-                    # column up and make the solver think a buried card is
-                    # the exposed one)
-                    print(f"[Warn] col{idx}: unresolved card {c!r}; truncating column read here")
-                    break
-            cols.append(col)
-
-        free = []
-        for c in board["free_cells"]:
-            if c and "suit" in c:
-                free.append((c["rank"], c["suit"]))
-
-        found = {}
-        for c in board["foundation"]:
-            if c and "suit" in c:
-                found[c["suit"]] = rank_val(c["rank"])
-
-        print("[*] Formulated Solver State:")
-        print(f"  Cols: {cols}")
-        print(f"  Free: {free}")
-        print(f"  Found: {found}")
-
-        if args.solver == "monte-carlo":
-            print("[*] Running Monte Carlo move search...")
-            state = State(cols, free, found)
-            move, statistics = choose_move_monte_carlo(state)
-            print_statistics(statistics)
-
-            if move:
-                execute_move(board, move, sim_mode=sim_mode)
-            else:
-                print("[*] No moves found. Board might already be solved or no path exists.")
-        else:
-            print("[*] Searching for a path...")
-            path, explored, solved = solve(cols, initial_free=free, initial_found=found, time_limit=5.0)
-
-            if path:
-                batch = path if args.moves_per_cycle <= 0 else path[:args.moves_per_cycle]
-                print(f"[*] Executing {len(batch)} move(s) this cycle:")
-                for idx, mv in enumerate(batch):
-                    print(f"  {idx+1}. {mv}")
-                    ok = execute_move(board, mv, sim_mode=sim_mode)
-                    if not ok:
-                        print("[*] Stopping batch early; will re-read the board next cycle.")
-                        break
-                    # Keep our local board model in sync so the next move's
-                    # coordinates can be computed without re-reading the screen.
-                    apply_move_to_board(board, mv)
-            else:
-                print("[*] No moves found. Board might already be solved or no path exists.")
-
-        if sim_mode:
-            # Only run once in simulation mode
-            break
-        
-        # Interval wait between cycles
-        print(f"[*] Waiting for UI update ({args.interval}s)...")
-        time.sleep(args.interval)
 
 if __name__ == "__main__":
     main()
