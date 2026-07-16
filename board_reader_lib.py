@@ -92,6 +92,32 @@ class BoardTransform:
         return data
 
 
+@dataclass(frozen=True)
+class ObservedColumn:
+    hidden_count: int
+    visible_cards: tuple[dict[str, Any], ...]
+
+    def to_json_data(self) -> dict[str, Any]:
+        return {
+            "hidden_count": self.hidden_count,
+            "visible_cards": list(self.visible_cards),
+        }
+
+
+@dataclass(frozen=True)
+class BoardObservation:
+    columns: tuple[ObservedColumn, ...]
+    free_cells: tuple[dict[str, Any] | None, ...]
+    foundation: tuple[dict[str, Any] | None, ...]
+
+    def to_json_data(self) -> dict[str, Any]:
+        return {
+            "columns": [column.to_json_data() for column in self.columns],
+            "free_cells": list(self.free_cells),
+            "foundation": list(self.foundation),
+        }
+
+
 REFERENCE_LAYOUT = BoardLayout()
 
 # Backward-compatible exports for existing helpers.
@@ -304,7 +330,13 @@ def _scan_rows_for_column(
     for idx in range(hidden_count):
         y = int(round(y_box + idx * hidden_step)) if has_back and top_offset <= hidden_step / 2 else int(round(global_top + idx * hidden_step))
         row_positions.append(y)
-        cards.append({"rank": "?", "color": "?", "score": 0.0})
+        cards.append({
+            "rank": "?",
+            "color": "?",
+            "score": 0.0,
+            "face_down": True,
+            "provenance": "hidden_face_down",
+        })
         report["rows"].append({"kind": "hidden", "y": y})
 
     for row in range(revealed_count):
@@ -333,7 +365,13 @@ def _scan_rows_for_column(
             report["rejections"].append({"reason": "low_confidence_rank", "y": y, "rank": name, "score": float(score)})
             name, color, score = "?", "?", 0.0
         row_positions.append(y)
-        card = {"rank": name, "color": color, "score": round(float(score), 2)}
+        card = {
+            "rank": name,
+            "color": color,
+            "score": round(float(score), 2),
+            "face_down": False,
+            "provenance": "ocr_visible",
+        }
         cards.append(card)
         report["rows"].append({"kind": "revealed", "y": y, "rank": name, "color": color, "score": round(float(score), 3)})
 
@@ -360,7 +398,7 @@ def _reject_impossible_multiplicities(board: dict[str, Any], report: dict[str, A
     for area in [f"col{i}" for i in range(7)] + ["free_cells", "foundation"]:
         cards = board.get(area, [])
         for idx, card in enumerate(cards):
-            if not card or card.get("rank") == "?" or card.get("color") == "?":
+            if not card or card.get("face_down") or card.get("rank") == "?" or card.get("color") == "?":
                 continue
             key = (card["rank"], card["color"])
             counts.setdefault(key, []).append({"area": area, "index": idx})
@@ -385,6 +423,21 @@ def _reject_impossible_multiplicities(board: dict[str, Any], report: dict[str, A
                 card["rank"] = "?"
                 card["color"] = "?"
                 card["score"] = 0.0
+                card["provenance"] = "rejected_impossible_multiplicity"
+
+
+def build_observation(board: dict[str, Any]) -> BoardObservation:
+    columns = []
+    for idx in range(7):
+        cards = board.get(f"col{idx}", [])
+        hidden_count = sum(1 for card in cards if card and card.get("face_down"))
+        visible_cards = tuple(card for card in cards if card and not card.get("face_down"))
+        columns.append(ObservedColumn(hidden_count=hidden_count, visible_cards=visible_cards))
+    return BoardObservation(
+        columns=tuple(columns),
+        free_cells=tuple(board.get("free_cells", [])),
+        foundation=tuple(board.get("foundation", [])),
+    )
 
 
 def _detect_slot_y(img: np.ndarray, layout: BoardLayout, tableau_top: int) -> int:
@@ -474,8 +527,10 @@ def read_board(
     _reject_impossible_multiplicities(board, detection_report)
 
     if include_metadata:
+        observation = build_observation(board)
         return {
             "board": board,
+            "observation": observation,
             "layout": calibrated_layout,
             "transform": transform,
             "normalized_image": img,
@@ -543,6 +598,7 @@ def save_calibration_artifacts(image_or_path, calibration_dir, layout: BoardLayo
         **result["detection_report"],
         "transform": result["transform"].to_json_data(),
         "board": result["board"],
+        "observation": result["observation"].to_json_data(),
     }
     (out / "detection_report.json").write_text(json.dumps(detection_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return detection_payload

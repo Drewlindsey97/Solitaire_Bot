@@ -5,6 +5,7 @@ import os
 import argparse
 import json
 import shutil
+from dataclasses import asdict, dataclass
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +46,12 @@ def assign_pseudo_suits(board):
 
     def process_card(card):
         if card is None:
+            return
+        if card.get("face_down"):
+            card["suit_source"] = "hidden_face_down"
+            return
+        if card.get("suit_source") == "ambiguous":
+            card["suit"] = "?"
             return
         if card.get("suit") in ("S", "H", "D", "C"):
             card.setdefault("suit_source", "observed_exact")
@@ -97,14 +104,29 @@ def assign_pseudo_suits(board):
 # ==============================================================================
 # 2. COORDINATE RESOLUTION
 # ==============================================================================
+def column_hidden_count(board, index):
+    observed = board.get("observed_columns")
+    if observed:
+        return observed[index]["hidden_count"]
+    return sum(1 for c in board.get(f"col{index}", []) if c.get("face_down"))
+
+
+def column_visible_cards(board, index):
+    observed = board.get("observed_columns")
+    if observed:
+        return observed[index]["visible_cards"]
+    return [c for c in board.get(f"col{index}", []) if not c.get("face_down")]
+
+
 def get_element_coords(board, item_type, index, transform=None, layout=None):
     """
     Calculates the exact center coordinate (x, y) for target slots or top cards.
     """
     layout = layout or BoardLayout()
     if item_type == "col":
-        col_cards = board[f"col{index}"]
-        num_cards = len(col_cards)
+        hidden_count = column_hidden_count(board, index)
+        visible_cards = column_visible_cards(board, index)
+        num_cards = hidden_count + len(visible_cards)
         x_center = layout.tableau_x[index] + layout.column_width / 2
         
         if num_cards == 0:
@@ -112,8 +134,7 @@ def get_element_coords(board, item_type, index, transform=None, layout=None):
             y_center = layout.tableau_y_top + layout.slot_height / 2
         else:
             # Find Y position of the bottom revealed card (exposed card)
-            hidden_count = sum(1 for c in col_cards if c.get("rank") == "?")
-            revealed_count = num_cards - hidden_count
+            revealed_count = len(visible_cards)
             y_edge = layout.tableau_y_top + hidden_count * layout.hidden_card_step + max(0, revealed_count - 1) * layout.revealed_card_step
             y_center = y_edge + layout.slot_height / 2
         if transform is not None:
@@ -264,7 +285,7 @@ def execute_move(board, move, sim_mode=False, event_logger=None, transform=None,
     # blindly swiping in that case would drag the wrong real card.
     if kind in ("col_to_found", "col_to_col", "col_to_free"):
         ci = move[1]
-        physical_col = board[f"col{ci}"]
+        physical_col = column_visible_cards(board, ci)
         top = physical_col[-1] if physical_col else None
         card = move[-1]
         if not top or top.get("rank") != card[0] or top.get("suit") != card[1]:
@@ -336,7 +357,7 @@ def count_unresolved_cards(board):
     unresolved = 0
     for idx in range(7):
         for card in board.get(f"col{idx}", []):
-            if card and (card.get("rank") == "?" or card.get("color") == "?"):
+            if card and not card.get("face_down") and (card.get("rank") == "?" or card.get("color") == "?"):
                 unresolved += 1
     for area in ("free_cells", "foundation"):
         for card in board.get(area, []):
@@ -357,6 +378,226 @@ def move_to_data(move):
     return list(move)
 
 
+@dataclass(frozen=True)
+class ExpectedTransition:
+    kind: str
+    expected_state: State
+    hidden_counts_before: list[int]
+    hidden_counts_after: list[int]
+    reveal_column: int | None = None
+
+    def to_json_data(self):
+        return {
+            "kind": self.kind,
+            "expected_state": state_to_data(self.expected_state),
+            "hidden_counts_before": self.hidden_counts_before,
+            "hidden_counts_after": self.hidden_counts_after,
+            "reveal_column": self.reveal_column,
+        }
+
+
+def observation_to_data(observation):
+    if observation is None:
+        return None
+    if hasattr(observation, "to_json_data"):
+        return observation.to_json_data()
+    return observation
+
+
+def hidden_counts_from_normalized(normalized):
+    observed = normalized.get("observed_columns")
+    if observed is not None:
+        return [column["hidden_count"] for column in observed]
+    return [
+        sum(1 for card in normalized.get("board", {}).get(f"col{idx}", []) if card.get("face_down"))
+        for idx in range(7)
+    ]
+
+
+def build_expected_transition(previous_normalized, move):
+    expected_state = apply_move(previous_normalized["state"], move)
+    before_hidden = hidden_counts_from_normalized(previous_normalized)
+    after_hidden = list(before_hidden)
+    reveal_column = None
+    if move[0] in ("col_to_found", "col_to_col", "col_to_free"):
+        source_col = move[1]
+        observed = previous_normalized.get("observed_columns")
+        if observed is not None:
+            visible = observed[source_col]["visible_cards"]
+        else:
+            visible = previous_normalized["board"].get(f"col{source_col}", [])
+        if len(visible) == 1 and before_hidden[source_col] > 0:
+            after_hidden[source_col] -= 1
+            reveal_column = source_col
+    kind = "reveal" if reveal_column is not None else "deterministic"
+    return ExpectedTransition(kind, expected_state, before_hidden, after_hidden, reveal_column)
+
+
+def _identity_status(card):
+    if card is None:
+        return "empty"
+    if card.get("rank") == "?" or card.get("color") == "?" or card.get("suit_source") == "unresolved":
+        return "unresolved"
+    if card.get("suit_source") == "ambiguous" or card.get("suit") not in ("S", "H", "D", "C"):
+        return "ambiguous"
+    return "known"
+
+
+def _top_visible_card(normalized, column_index):
+    observed = normalized.get("observed_columns", [])
+    if not observed:
+        return None
+    cards = observed[column_index]["visible_cards"]
+    return cards[-1] if cards else None
+
+
+def _column_structurally_empty(normalized, column_index):
+    observed = normalized.get("observed_columns", [])
+    if not observed:
+        return not normalized["state"].cols[column_index]
+    return observed[column_index]["hidden_count"] == 0 and not observed[column_index]["visible_cards"]
+
+
+def assess_move_safety(move, normalized):
+    reasons = []
+    kind = move[0]
+
+    def check_source_col(column_index):
+        status = _identity_status(_top_visible_card(normalized, column_index))
+        if status == "unresolved":
+            reasons.append("blocked_by_unresolved_source")
+        elif status == "ambiguous":
+            reasons.append("blocked_by_ambiguous_identity")
+
+    def check_dest_col(column_index):
+        if _column_structurally_empty(normalized, column_index):
+            return
+        status = _identity_status(_top_visible_card(normalized, column_index))
+        if status == "unresolved":
+            reasons.append("blocked_by_unresolved_destination")
+        elif status == "ambiguous":
+            reasons.append("blocked_by_ambiguous_identity")
+
+    def check_free_card(card_tuple):
+        for card in normalized["board"].get("free_cells", []):
+            if card and card.get("rank") == card_tuple[0] and card.get("suit") == card_tuple[1]:
+                status = _identity_status(card)
+                if status == "unresolved":
+                    reasons.append("blocked_by_unresolved_source")
+                elif status == "ambiguous":
+                    reasons.append("blocked_by_ambiguous_identity")
+                return
+        reasons.append("blocked_by_unresolved_source")
+
+    if kind in ("col_to_found", "col_to_free"):
+        check_source_col(move[1])
+    elif kind == "col_to_col":
+        check_source_col(move[1])
+        check_dest_col(move[2])
+    elif kind == "free_to_found":
+        check_free_card(move[1])
+    elif kind == "free_to_col":
+        check_free_card(move[2])
+        check_dest_col(move[1])
+
+    unique_reasons = list(dict.fromkeys(reasons))
+    return {
+        "move": move,
+        "safe": not unique_reasons,
+        "blocked_by_unresolved_source": "blocked_by_unresolved_source" in unique_reasons,
+        "blocked_by_unresolved_destination": "blocked_by_unresolved_destination" in unique_reasons,
+        "blocked_by_ambiguous_identity": "blocked_by_ambiguous_identity" in unique_reasons,
+        "reasons": unique_reasons,
+    }
+
+
+def filter_safe_legal_moves(moves, normalized):
+    assessments = [assess_move_safety(move, normalized) for move in moves]
+    generated_sources = {
+        move[1]
+        for move in moves
+        if move[0] in ("col_to_found", "col_to_col", "col_to_free")
+    }
+    for column_index, column in enumerate(normalized.get("observed_columns", [])):
+        if column_index in generated_sources or not column["visible_cards"]:
+            continue
+        status = _identity_status(column["visible_cards"][-1])
+        if status == "unresolved":
+            assessments.append({
+                "move": ("blocked_col_source", column_index),
+                "safe": False,
+                "blocked_by_unresolved_source": True,
+                "blocked_by_unresolved_destination": False,
+                "blocked_by_ambiguous_identity": False,
+                "reasons": ["blocked_by_unresolved_source"],
+            })
+        elif status == "ambiguous":
+            assessments.append({
+                "move": ("blocked_col_source", column_index),
+                "safe": False,
+                "blocked_by_unresolved_source": False,
+                "blocked_by_unresolved_destination": False,
+                "blocked_by_ambiguous_identity": True,
+                "reasons": ["blocked_by_ambiguous_identity"],
+            })
+    safe_moves = [item["move"] for item in assessments if item["safe"]]
+    excluded = [item for item in assessments if not item["safe"]]
+    return safe_moves, assessments, excluded
+
+
+def compare_expected_transition(expected_transition, actual_normalized):
+    if expected_transition.kind == "deterministic":
+        return compare_normalized_state(expected_transition.expected_state, actual_normalized)
+
+    differences = []
+    actual_hidden = hidden_counts_from_normalized(actual_normalized)
+    if actual_hidden != expected_transition.hidden_counts_after:
+        differences.append({
+            "field": "hidden_counts",
+            "expected": expected_transition.hidden_counts_after,
+            "actual": actual_hidden,
+        })
+    col = expected_transition.reveal_column
+    if col is not None:
+        actual_visible = actual_normalized["observed_columns"][col]["visible_cards"]
+        expected_visible_len = len(expected_transition.expected_state.cols[col]) + 1
+        if len(actual_visible) != expected_visible_len:
+            differences.append({
+                "field": f"col{col}_visible_count",
+                "expected": expected_visible_len,
+                "actual": len(actual_visible),
+            })
+        elif actual_visible and (
+            actual_visible[-1].get("rank") == "?" or
+            actual_visible[-1].get("color") == "?" or
+            actual_visible[-1].get("suit_source") in ("ambiguous", "unresolved")
+        ):
+            differences.append({
+                "field": f"col{col}_revealed_card",
+                "expected": "new readable exposed card",
+                "actual": actual_visible[-1],
+            })
+    if actual_normalized["ambiguous_cards"] or actual_normalized["unresolved_cards"]:
+        differences.append({
+            "field": "trust_reasons",
+            "expected": [],
+            "actual": {
+                "unresolved_exposed_cards": actual_normalized["unresolved_cards"],
+                "ambiguous_cards": actual_normalized["ambiguous_cards"],
+            },
+        })
+    return {
+        "matches": not differences,
+        "differences": differences,
+        "expected_transition": expected_transition.to_json_data(),
+        "actual_state": actual_normalized["state_data"],
+        "actual_hidden_counts": actual_hidden,
+        "actual_unresolved_cards": actual_normalized["unresolved_cards"],
+        "actual_ambiguous_cards": actual_normalized["ambiguous_cards"],
+        "actual_trust_status": actual_normalized["trust_status"],
+    }
+
+
 def build_normalized_state(board, allow_best_effort=False):
     """
     Split raw OCR observations from solver identities.
@@ -368,10 +609,12 @@ def build_normalized_state(board, allow_best_effort=False):
     resolved_board = deepcopy(board)
     assign_pseudo_suits(resolved_board)
 
-    unresolved_cards = []
-    ambiguous_cards = []
+    unresolved_exposed_cards = []
+    ambiguous_exposed_cards = []
     truncated_columns = []
     cols = []
+    observed_columns = []
+    untrusted_reasons = []
 
     def note_card(collection, index, card, reason):
         payload = {
@@ -381,13 +624,19 @@ def build_normalized_state(board, allow_best_effort=False):
             "reason": reason,
         }
         if reason == "ambiguous":
-            ambiguous_cards.append(payload)
+            ambiguous_exposed_cards.append(payload)
         else:
-            unresolved_cards.append(payload)
+            unresolved_exposed_cards.append(payload)
 
     for idx in range(7):
         col = []
+        hidden_count = 0
+        visible_cards = []
         for card_index, card in enumerate(resolved_board[f"col{idx}"]):
+            if card.get("face_down"):
+                hidden_count += 1
+                continue
+            visible_cards.append(card)
             source = card.get("suit_source")
             if card.get("rank") == "?" or card.get("color") == "?":
                 note_card(f"col{idx}", card_index, card, "unresolved")
@@ -402,6 +651,10 @@ def build_normalized_state(board, allow_best_effort=False):
                 continue
             col.append((card["rank"], card["suit"]))
         cols.append(col)
+        observed_columns.append({
+            "hidden_count": hidden_count,
+            "visible_cards": visible_cards,
+        })
 
     free = []
     for idx, card in enumerate(resolved_board["free_cells"]):
@@ -428,21 +681,35 @@ def build_normalized_state(board, allow_best_effort=False):
             found[card["suit"]] = rank_val(card["rank"])
 
     state = State(cols, free, found)
-    trustworthy = not unresolved_cards and not ambiguous_cards
+    if unresolved_exposed_cards:
+        untrusted_reasons.append("unresolved_exposed_cards")
+    if ambiguous_exposed_cards:
+        untrusted_reasons.append("ambiguous_exposed_cards")
+    trustworthy = not untrusted_reasons
     trust_status = "trustworthy" if trustworthy else "untrusted"
 
     return {
         "board": resolved_board,
+        "observed_columns": observed_columns,
+        "hidden_counts": [column["hidden_count"] for column in observed_columns],
+        "visible_confidence": [
+            [card.get("score", 0.0) for card in column["visible_cards"]]
+            for column in observed_columns
+        ],
         "state": state,
         "state_data": state_to_data(state),
         "columns": cols,
         "free": free,
         "foundations": found,
-        "unresolved_cards": unresolved_cards,
-        "ambiguous_cards": ambiguous_cards,
+        "unresolved_cards": unresolved_exposed_cards,
+        "ambiguous_cards": ambiguous_exposed_cards,
+        "unresolved_exposed_cards": unresolved_exposed_cards,
+        "ambiguous_exposed_cards": ambiguous_exposed_cards,
+        "unresolved_exposed_count": len(unresolved_exposed_cards),
         "truncated_columns": truncated_columns,
         "trustworthy": trustworthy,
         "trust_status": trust_status,
+        "untrusted_reasons": untrusted_reasons,
         "allow_best_effort": allow_best_effort,
     }
 
@@ -495,6 +762,7 @@ def compare_normalized_state(expected_state, actual_normalized):
 def read_and_normalize_board(screenshot_path, allow_best_effort=False, layout=None):
     read_result = read_board(str(screenshot_path), layout=layout, include_metadata=True)
     normalized = build_normalized_state(read_result["board"], allow_best_effort=allow_best_effort)
+    normalized["observation"] = observation_to_data(read_result.get("observation"))
     normalized["layout"] = read_result["layout"]
     normalized["transform"] = read_result["transform"]
     normalized["detection_report"] = read_result["detection_report"]
@@ -551,6 +819,9 @@ def save_failure_artifacts(
         "trust_status": previous_normalized["trust_status"],
         "unresolved_cards": previous_normalized["unresolved_cards"],
         "ambiguous_cards": previous_normalized["ambiguous_cards"],
+        "hidden_counts": previous_normalized.get("hidden_counts", []),
+        "unresolved_exposed_cards": previous_normalized.get("unresolved_exposed_cards", previous_normalized["unresolved_cards"]),
+        "ambiguous_exposed_cards": previous_normalized.get("ambiguous_exposed_cards", previous_normalized["ambiguous_cards"]),
     })
     write_json(directory / "expected_state.json", state_to_data(expected_state))
     write_json(directory / "final_actual_state.json", {
@@ -558,6 +829,9 @@ def save_failure_artifacts(
         "trust_status": final_actual_normalized["trust_status"] if final_actual_normalized else "unavailable",
         "unresolved_cards": final_actual_normalized["unresolved_cards"] if final_actual_normalized else [],
         "ambiguous_cards": final_actual_normalized["ambiguous_cards"] if final_actual_normalized else [],
+        "hidden_counts": final_actual_normalized.get("hidden_counts", []) if final_actual_normalized else [],
+        "unresolved_exposed_cards": final_actual_normalized.get("unresolved_exposed_cards", final_actual_normalized["unresolved_cards"]) if final_actual_normalized else [],
+        "ambiguous_exposed_cards": final_actual_normalized.get("ambiguous_exposed_cards", final_actual_normalized["ambiguous_cards"]) if final_actual_normalized else [],
     })
     write_json(directory / "selected_move.json", {"move": move_to_data(selected_move)})
     write_json(directory / "mismatch_report.json", mismatch_report)
@@ -578,6 +852,7 @@ def verify_expected_state(
     delay,
     screenshot_prefix,
     event_logger=None,
+    expected_transition=None,
 ):
     emit = event_logger or (lambda event_name, **data: None)
     screenshots = []
@@ -606,7 +881,10 @@ def verify_expected_state(
                 screenshot_path,
                 allow_best_effort=allow_best_effort,
             )
-            final_report = compare_normalized_state(expected_state, final_actual)
+            if expected_transition is not None:
+                final_report = compare_expected_transition(expected_transition, final_actual)
+            else:
+                final_report = compare_normalized_state(expected_state, final_actual)
         except Exception as exc:
             final_report = {
                 "matches": False,
@@ -947,23 +1225,31 @@ def main():
             board_seconds = time.perf_counter() - board_started
             board = normalized["board"]
             state = normalized["state"]
-            unresolved_cards = count_unresolved_cards(board)
+            unresolved_cards = normalized.get("unresolved_exposed_count", len(normalized["unresolved_cards"]))
             log_event(
                 "board_read",
                 cycle=cycle_number,
                 duration_seconds=board_seconds,
-                unresolved_cards=unresolved_cards,
+                hidden_counts=normalized.get("hidden_counts", []),
+                unresolved_exposed_count=normalized.get("unresolved_exposed_count", len(normalized["unresolved_cards"])),
+                unresolved_exposed_cards=normalized.get("unresolved_exposed_cards", normalized["unresolved_cards"]),
+                ambiguous_exposed_cards=normalized.get("ambiguous_exposed_cards", normalized["ambiguous_cards"]),
+                visible_confidence=normalized.get("visible_confidence", []),
+                trust_status=normalized["trust_status"],
+                untrusted_reasons=normalized.get("untrusted_reasons", []),
                 board=board,
+                observation=normalized.get("observation"),
             )
 
             print("[*] Board Cards Detected:")
             for idx in range(7):
                 col_key = f"col{idx}"
+                observed = normalized.get("observed_columns", [{"hidden_count": 0, "visible_cards": board.get(f"col{i}", [])} for i in range(7)])[idx]
                 col_info = [
-                    f"{c['rank']}({c['color']},{c.get('suit', '?')},{c.get('suit_source', '?')})"
-                    for c in board[col_key]
+                    f"{c['rank']}({c['color']},{c.get('suit', '?')},{c.get('suit_source', '?')},score={c.get('score', 0.0)})"
+                    for c in observed["visible_cards"]
                 ]
-                print(f"  col{idx}: {col_info}")
+                print(f"  col{idx}: hidden={observed['hidden_count']} visible={col_info}")
 
             free_info = [
                 f"{c['rank']}({c['color']},{c.get('suit', '?')},{c.get('suit_source', '?')})"
@@ -982,6 +1268,9 @@ def main():
             print(f"  Cols: {normalized['columns']}")
             print(f"  Free: {normalized['free']}")
             print(f"  Found: {normalized['foundations']}")
+            print(f"  Hidden: {normalized.get('hidden_counts', [])}")
+            print(f"  Unresolved exposed: {len(normalized.get('unresolved_exposed_cards', normalized['unresolved_cards']))}")
+            print(f"  Ambiguous exposed: {len(normalized.get('ambiguous_exposed_cards', normalized['ambiguous_cards']))}")
             print(f"  Trust: {normalized['trust_status']}")
             log_event(
                 "solver_state_built",
@@ -989,10 +1278,13 @@ def main():
                 columns=normalized["columns"],
                 free=normalized["free"],
                 foundations=normalized["foundations"],
-                unresolved_cards=normalized["unresolved_cards"],
-                ambiguous_cards=normalized["ambiguous_cards"],
+                hidden_counts=normalized.get("hidden_counts", []),
+                unresolved_exposed_cards=normalized.get("unresolved_exposed_cards", normalized["unresolved_cards"]),
+                ambiguous_exposed_cards=normalized.get("ambiguous_exposed_cards", normalized["ambiguous_cards"]),
+                visible_confidence=normalized.get("visible_confidence", []),
                 truncated_columns=normalized["truncated_columns"],
                 trust_status=normalized["trust_status"],
+                untrusted_reasons=normalized.get("untrusted_reasons", []),
             )
 
             if not sim_mode and not normalized["trustworthy"]:
@@ -1000,14 +1292,25 @@ def main():
                 log_event(
                     "unsafe_state_stopped",
                     cycle=cycle_number,
-                    unresolved_cards=normalized["unresolved_cards"],
-                    ambiguous_cards=normalized["ambiguous_cards"],
+                    unresolved_exposed_cards=normalized.get("unresolved_exposed_cards", normalized["unresolved_cards"]),
+                    ambiguous_exposed_cards=normalized.get("ambiguous_exposed_cards", normalized["ambiguous_cards"]),
+                    untrusted_reasons=normalized.get("untrusted_reasons", []),
                 )
                 break
 
-            legal_moves = generate_complete_moves(state)
-            log_event("legal_moves_generated", cycle=cycle_number, legal_moves=legal_moves)
+            raw_legal_moves = generate_complete_moves(state)
+            legal_moves, candidate_safety, excluded_candidates = filter_safe_legal_moves(raw_legal_moves, normalized)
+            log_event(
+                "legal_moves_generated",
+                cycle=cycle_number,
+                legal_moves=legal_moves,
+                raw_legal_moves=raw_legal_moves,
+                candidate_safety=candidate_safety,
+                excluded_candidates=excluded_candidates,
+            )
             print(f"[*] Legal moves: {len(legal_moves)}")
+            if excluded_candidates:
+                print(f"[*] Excluded unsafe candidate moves: {len(excluded_candidates)}")
 
             try:
                 move, selection = choose_next_move(
@@ -1026,18 +1329,21 @@ def main():
                 log_event("no_move_selected", cycle=cycle_number, solver=args.solver, legal_moves=legal_moves)
                 break
 
-            if move not in generate_complete_moves(state):
+            current_legal_moves, _, _ = filter_safe_legal_moves(generate_complete_moves(state), normalized)
+            if move not in current_legal_moves:
                 print(f"[Error] Selected move is no longer legal: {move}")
                 log_event("move_rejected", cycle=cycle_number, move=move, reason="selected_move_not_legal")
                 break
 
-            expected_state = apply_move(state, move)
+            expected_transition = build_expected_transition(normalized, move)
+            expected_state = expected_transition.expected_state
             log_event(
                 "move_selected",
                 cycle=cycle_number,
                 move=move,
                 selection=selection,
                 expected_state=state_to_data(expected_state),
+                expected_transition=expected_transition.to_json_data(),
             )
 
             if sim_mode and args.solver == "search" and selection.get("path"):
@@ -1049,7 +1355,8 @@ def main():
             current_state = state
             gesture_result = {"ok": False, "reason": "not_dispatched"}
             for idx, batch_move in enumerate(batch):
-                if batch_move not in generate_complete_moves(current_state):
+                current_batch_moves, _, _ = filter_safe_legal_moves(generate_complete_moves(current_state), normalized)
+                if batch_move not in current_batch_moves:
                     print(f"[Error] Batch move is not legal: {batch_move}")
                     log_event(
                         "move_rejected",
@@ -1093,6 +1400,7 @@ def main():
 
             verification = verify_expected_state(
                 expected_state=expected_state,
+                expected_transition=expected_transition,
                 allow_best_effort=False,
                 attempts=max(1, args.verify_attempts),
                 delay=max(0.0, args.verify_delay),

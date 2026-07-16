@@ -14,8 +14,11 @@ from freecell_solver import (
 )
 from monte_carlo_solver import choose_move_monte_carlo
 from solitaire_auto_bot import (
+    build_expected_transition,
     build_normalized_state,
+    compare_expected_transition,
     compare_normalized_state,
+    filter_safe_legal_moves,
     save_failure_artifacts,
     state_to_data,
     verify_expected_state,
@@ -36,6 +39,16 @@ def card(rank, suit=None, color=None):
     if suit:
         payload["suit"] = suit
     return payload
+
+
+def hidden_card():
+    return {
+        "rank": "?",
+        "color": "?",
+        "score": 0.0,
+        "face_down": True,
+        "provenance": "hidden_face_down",
+    }
 
 
 class MoveLoopTests(unittest.TestCase):
@@ -363,6 +376,155 @@ class MoveLoopTests(unittest.TestCase):
         self.assertFalse(normalized["trustworthy"])
         self.assertEqual(normalized["board"]["col0"][1]["suit_source"], "resolved_by_constraints")
         self.assertEqual(normalized["board"]["col0"][3]["suit_source"], "ambiguous")
+
+    def test_hidden_cards_do_not_make_state_untrusted(self):
+        board = empty_board()
+        board["col0"] = [hidden_card(), hidden_card(), card("K", "S")]
+
+        normalized = build_normalized_state(board)
+
+        self.assertTrue(normalized["trustworthy"])
+        self.assertEqual(normalized["hidden_counts"], [2, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(normalized["unresolved_exposed_count"], 0)
+        self.assertEqual(normalized["columns"][0], [("K", "S")])
+
+    def test_unresolved_exposed_card_makes_state_untrusted(self):
+        board = empty_board()
+        board["col0"] = [hidden_card(), {"rank": "?", "color": "?", "score": 0.0, "face_down": False}]
+
+        normalized = build_normalized_state(board, allow_best_effort=True)
+
+        self.assertFalse(normalized["trustworthy"])
+        self.assertEqual(normalized["hidden_counts"][0], 1)
+        self.assertEqual(len(normalized["unresolved_exposed_cards"]), 1)
+
+    def test_ambiguous_free_cell_makes_state_untrusted(self):
+        board = empty_board()
+        board["free_cells"][0] = {"rank": "K", "color": "BLACK", "score": 0.9, "suit": "?", "suit_source": "ambiguous"}
+
+        normalized = build_normalized_state(board)
+
+        self.assertFalse(normalized["trustworthy"])
+        self.assertEqual(normalized["ambiguous_exposed_cards"][0]["area"], "free_cells")
+
+    def test_solver_state_contains_only_visible_cards_and_preserves_hidden_counts(self):
+        board = empty_board()
+        board["col0"] = [hidden_card(), hidden_card(), card("Q", "H"), card("J", "S")]
+
+        normalized = build_normalized_state(board)
+
+        self.assertEqual(normalized["columns"][0], [("Q", "H"), ("J", "S")])
+        self.assertEqual(normalized["state"].cols[0], (("Q", "H"), ("J", "S")))
+        self.assertEqual(normalized["observed_columns"][0]["hidden_count"], 2)
+        self.assertEqual(len(normalized["observed_columns"][0]["visible_cards"]), 2)
+
+    def test_moving_last_visible_card_can_reveal_unknown_hidden_card(self):
+        board = empty_board()
+        board["col0"] = [hidden_card(), card("A", "S")]
+        normalized = build_normalized_state(board)
+
+        transition = build_expected_transition(normalized, ("col_to_found", 0, ("A", "S")))
+
+        self.assertEqual(transition.kind, "reveal")
+        self.assertEqual(transition.reveal_column, 0)
+        self.assertEqual(transition.hidden_counts_before[0], 1)
+        self.assertEqual(transition.hidden_counts_after[0], 0)
+        self.assertEqual(transition.expected_state.cols[0], ())
+
+    def test_reveal_transition_verification_succeeds_structurally(self):
+        board = empty_board()
+        board["col0"] = [hidden_card(), card("A", "S")]
+        before = build_normalized_state(board)
+        transition = build_expected_transition(before, ("col_to_found", 0, ("A", "S")))
+
+        after_board = empty_board()
+        after_board["col0"] = [card("K", "H")]
+        after = build_normalized_state(after_board)
+
+        report = compare_expected_transition(transition, after)
+
+        self.assertTrue(report["matches"])
+
+    def test_reveal_transition_verification_fails_when_hidden_count_does_not_decrease(self):
+        board = empty_board()
+        board["col0"] = [hidden_card(), card("A", "S")]
+        before = build_normalized_state(board)
+        transition = build_expected_transition(before, ("col_to_found", 0, ("A", "S")))
+
+        after_board = empty_board()
+        after_board["col0"] = [hidden_card(), card("K", "H")]
+        after = build_normalized_state(after_board)
+
+        report = compare_expected_transition(transition, after)
+
+        self.assertFalse(report["matches"])
+        self.assertIn("hidden_counts", [diff["field"] for diff in report["differences"]])
+
+    def test_hidden_card_identity_is_not_invented(self):
+        board = empty_board()
+        board["col0"] = [hidden_card(), card("A", "S")]
+        normalized = build_normalized_state(board)
+        transition = build_expected_transition(normalized, ("col_to_found", 0, ("A", "S")))
+
+        self.assertEqual(normalized["columns"][0], [("A", "S")])
+        self.assertEqual(transition.expected_state.cols[0], ())
+        self.assertNotIn(("?", "?"), transition.expected_state.cols[0])
+
+    def test_unresolved_exposed_destination_is_not_treated_as_empty(self):
+        board = empty_board()
+        board["col0"] = [card("8", "S")]
+        board["col1"] = [{"rank": "?", "color": "?", "score": 0.0, "face_down": False}]
+        normalized = build_normalized_state(board, allow_best_effort=True)
+
+        safe_moves, _, excluded = filter_safe_legal_moves(generate_complete_moves(normalized["state"]), normalized)
+
+        self.assertNotIn(("col_to_col", 0, 1, ("8", "S")), safe_moves)
+        self.assertTrue(any(item["blocked_by_unresolved_destination"] for item in excluded))
+
+    def test_no_move_may_target_unresolved_exposed_destination(self):
+        board = empty_board()
+        board["col0"] = [card("8", "S")]
+        board["col1"] = [{"rank": "?", "color": "?", "score": 0.0, "face_down": False}]
+        board["col2"] = [card("9", "H")]
+        normalized = build_normalized_state(board, allow_best_effort=True)
+
+        safe_moves, _, _ = filter_safe_legal_moves(generate_complete_moves(normalized["state"]), normalized)
+
+        self.assertFalse(any(move[0] == "col_to_col" and move[2] == 1 for move in safe_moves))
+
+    def test_no_move_may_originate_from_unresolved_exposed_source(self):
+        board = empty_board()
+        board["col0"] = [{"rank": "?", "color": "?", "score": 0.0, "face_down": False}]
+        board["col1"] = [card("9", "H")]
+        normalized = build_normalized_state(board, allow_best_effort=True)
+
+        safe_moves, _, excluded = filter_safe_legal_moves(generate_complete_moves(normalized["state"]), normalized)
+
+        self.assertFalse(any(move[0].startswith("col_to") and move[1] == 0 for move in safe_moves))
+        self.assertFalse(any(move == ("col_to_col", 0, 1, ("?", "?")) for move in safe_moves))
+        self.assertTrue(any(item["blocked_by_unresolved_source"] for item in excluded))
+
+    def test_fully_known_columns_still_generate_legal_moves(self):
+        board = empty_board()
+        board["col0"] = [card("8", "S")]
+        board["col1"] = [card("9", "H")]
+        normalized = build_normalized_state(board)
+
+        safe_moves, _, excluded = filter_safe_legal_moves(generate_complete_moves(normalized["state"]), normalized)
+
+        self.assertIn(("col_to_col", 0, 1, ("8", "S")), safe_moves)
+        self.assertEqual(excluded, [])
+
+    def test_hidden_face_down_cards_do_not_block_unrelated_moves(self):
+        board = empty_board()
+        board["col0"] = [hidden_card(), card("K", "S")]
+        board["col1"] = [card("8", "S")]
+        board["col2"] = [card("9", "H")]
+        normalized = build_normalized_state(board)
+
+        safe_moves, _, _ = filter_safe_legal_moves(generate_complete_moves(normalized["state"]), normalized)
+
+        self.assertIn(("col_to_col", 1, 2, ("8", "S")), safe_moves)
 
 
 if __name__ == "__main__":
