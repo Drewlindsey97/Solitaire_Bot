@@ -234,6 +234,9 @@ def match_rank_detailed(patch, template_set):
     return best_name, best_score, ranked
 
 
+RANK_EXACT_THRESHOLD = 0.96
+
+
 def _candidate_margin(candidates: list[dict[str, Any]]) -> float:
     if len(candidates) < 2:
         return 1.0
@@ -283,10 +286,11 @@ def detect_ace_from_rank_corner(patch):
     }
 
 
-def assess_rank_attempts(attempts):
+def assess_rank_attempts(attempts, layout: "BoardLayout | None" = None):
+    layout = layout or BoardLayout()
     usable = []
-    exact_threshold = 0.96
-    min_signal_score = 0.55
+    exact_threshold = RANK_EXACT_THRESHOLD
+    min_signal_score = layout.min_rank_score
     min_margin = 0.08
     for attempt in attempts:
         source = attempt["source"]
@@ -342,7 +346,7 @@ def assess_rank_attempts(attempts):
         if len(corroborated) > 1:
             return rank, max(item["score"] for item in rank_attempts), "conflicting_recognizers", usable
         best_score = max(item["score"] for item in rank_attempts)
-        return rank, best_score, "template_confirmed", usable
+        return rank, best_score, "cross_source_corroborated", usable
 
     if len(by_rank) > 1:
         ranked = sorted(by_rank.items(), key=lambda item: max(attempt["score"] for attempt in item[1]), reverse=True)
@@ -365,19 +369,23 @@ def recognize_card_rank(img, x, y, is_last, layout: BoardLayout):
     attempts = []
     if is_last:
         full_patch = _safe_crop(img, x, y, layout.last_card_crop_width, layout.last_card_crop_height)
-        name, score, ranked = match_rank_detailed(full_patch, TEMPLATES_LAST)
-        attempts.append({"source": "full_last_card", "rank": name, "score": score, "candidates": ranked})
+        full_name, full_score, full_ranked = match_rank_detailed(full_patch, TEMPLATES_LAST)
+        attempts.append({"source": "full_last_card", "rank": full_name, "score": full_score, "candidates": full_ranked})
         corner_patch = _safe_crop(img, x, y, layout.rank_width, layout.rank_height)
-        ace = detect_ace_from_rank_corner(corner_patch)
-        if ace is not None:
-            attempts.append({
-                "source": "ace_corner_detector",
-                "rank": ace["rank"],
-                "score": ace["score"],
-                "candidates": ace["candidates"],
-            })
-        name, score, ranked = match_rank_detailed(corner_patch, TEMPLATES)
-        attempts.append({"source": "rank_corner", "rank": name, "score": score, "candidates": ranked})
+        corner_name, corner_score, corner_ranked = match_rank_detailed(corner_patch, TEMPLATES)
+        attempts.append({"source": "rank_corner", "rank": corner_name, "score": corner_score, "candidates": corner_ranked})
+        if full_score < RANK_EXACT_THRESHOLD and corner_score < RANK_EXACT_THRESHOLD:
+            # Template matching already scored below the threshold that would
+            # make assess_rank_attempts trust it outright, so the extra
+            # geometric ace check is only worth running here.
+            ace = detect_ace_from_rank_corner(corner_patch)
+            if ace is not None:
+                attempts.append({
+                    "source": "ace_corner_detector",
+                    "rank": ace["rank"],
+                    "score": ace["score"],
+                    "candidates": ace["candidates"],
+                })
         heuristic = live_shape_rank_heuristic(full_patch)
         if heuristic is not None:
             attempts.append({
@@ -388,21 +396,23 @@ def recognize_card_rank(img, x, y, is_last, layout: BoardLayout):
             })
     else:
         corner_patch = _safe_crop(img, x, y, layout.rank_width, layout.rank_height)
-        ace = detect_ace_from_rank_corner(corner_patch)
-        if ace is not None:
-            attempts.append({
-                "source": "ace_corner_detector",
-                "rank": ace["rank"],
-                "score": ace["score"],
-                "candidates": ace["candidates"],
-            })
         name, score, ranked = match_rank_detailed(corner_patch, TEMPLATES)
         attempts.append({"source": "rank_corner", "rank": name, "score": score, "candidates": ranked})
-    rank, score, provenance, usable = assess_rank_attempts(attempts)
+        if score < RANK_EXACT_THRESHOLD:
+            ace = detect_ace_from_rank_corner(corner_patch)
+            if ace is not None:
+                attempts.append({
+                    "source": "ace_corner_detector",
+                    "rank": ace["rank"],
+                    "score": ace["score"],
+                    "candidates": ace["candidates"],
+                })
+    rank, score, provenance, usable = assess_rank_attempts(attempts, layout)
     selected = max(
         [item for item in attempts if item["rank"] == rank] or attempts,
         key=lambda item: item["score"],
     )
+    margin_by_source = {item["source"]: item["margin"] for item in usable}
     return rank, score, {
         "selected_source": selected["source"],
         "rank_provenance": provenance,
@@ -412,7 +422,9 @@ def recognize_card_rank(img, x, y, is_last, layout: BoardLayout):
                 "source": item["source"],
                 "rank": item["rank"],
                 "score": round(float(item["score"]), 4),
-                "margin": round(float(_candidate_margin(item.get("candidates", []))), 4),
+                "margin": round(
+                    float(margin_by_source.get(item["source"], _candidate_margin(item.get("candidates", [])))), 4
+                ),
                 "candidates": item["candidates"][:10],
             }
             for item in attempts

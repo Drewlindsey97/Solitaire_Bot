@@ -145,18 +145,7 @@ def _original_point(normalized_point, transform):
 def _transform_log(transform):
     if transform is None:
         return None
-    return {
-        "scale_x": transform.scale_x,
-        "scale_y": transform.scale_y,
-        "content_x": transform.content_x,
-        "content_y": transform.content_y,
-        "content_width": transform.content_width,
-        "content_height": transform.content_height,
-        "original_width": transform.original_width,
-        "original_height": transform.original_height,
-        "reference_width": transform.reference_width,
-        "reference_height": transform.reference_height,
-    }
+    return transform.to_json_data()
 
 
 def column_hidden_count(board, index):
@@ -248,6 +237,20 @@ def get_element_coords(board, item_type, index, transform=None, layout=None):
     return original["x"], original["y"]
 
 
+def find_free_cell_index(board, rank, suit):
+    for idx, c in enumerate(board["free_cells"]):
+        if c and c.get("rank") == rank and c.get("suit") == suit:
+            return idx
+    return None
+
+
+def find_empty_free_cell_index(board):
+    for idx, c in enumerate(board["free_cells"]):
+        if c is None:
+            return idx
+    return None
+
+
 def plan_gesture(board, move, transform=None, layout=None):
     layout = layout or BoardLayout()
     kind = move[0]
@@ -261,7 +264,7 @@ def plan_gesture(board, move, transform=None, layout=None):
         end = get_element_point(board, "found", 0, transform=transform, layout=layout)
     elif kind == "free_to_found":
         _, card = move
-        fi = next((idx for idx, c in enumerate(board["free_cells"]) if c and c.get("rank") == card[0] and c.get("suit") == card[1]), None)
+        fi = find_free_cell_index(board, card[0], card[1])
         if fi is not None:
             start = get_element_point(board, "free", fi, transform=transform, layout=layout, role="source")
             end = get_element_point(board, "found", 0, transform=transform, layout=layout)
@@ -271,13 +274,13 @@ def plan_gesture(board, move, transform=None, layout=None):
         end = get_element_point(board, "col", cj, transform=transform, layout=layout)
     elif kind == "col_to_free":
         _, ci, card = move
-        fi = next((idx for idx, c in enumerate(board["free_cells"]) if c is None), None)
+        fi = find_empty_free_cell_index(board)
         if fi is not None:
             start = get_element_point(board, "col", ci, transform=transform, layout=layout, role="source")
             end = get_element_point(board, "free", fi, transform=transform, layout=layout)
     elif kind == "free_to_col":
         _, cj, card = move
-        fi = next((idx for idx, c in enumerate(board["free_cells"]) if c and c.get("rank") == card[0] and c.get("suit") == card[1]), None)
+        fi = find_free_cell_index(board, card[0], card[1])
         if fi is not None:
             start = get_element_point(board, "free", fi, transform=transform, layout=layout, role="source")
             end = get_element_point(board, "col", cj, transform=transform, layout=layout)
@@ -317,24 +320,12 @@ def apply_move_to_board(board, move):
     """
     kind = move[0]
 
-    def find_free(rank, suit):
-        for idx, c in enumerate(board["free_cells"]):
-            if c and c.get("rank") == rank and c.get("suit") == suit:
-                return idx
-        return None
-
-    def first_empty_free():
-        for idx, c in enumerate(board["free_cells"]):
-            if c is None:
-                return idx
-        return None
-
     if kind == "col_to_found":
         _, ci, card = move
         board[f"col{ci}"].pop()
     elif kind == "free_to_found":
         _, card = move
-        fi = find_free(card[0], card[1])
+        fi = find_free_cell_index(board, card[0], card[1])
         if fi is not None:
             board["free_cells"][fi] = None
     elif kind == "col_to_col":
@@ -344,12 +335,12 @@ def apply_move_to_board(board, move):
     elif kind == "col_to_free":
         _, ci, card = move
         board[f"col{ci}"].pop()
-        fi = first_empty_free()
+        fi = find_empty_free_cell_index(board)
         if fi is not None:
             board["free_cells"][fi] = {"rank": card[0], "suit": card[1], "color": card_color(card[1]), "score": 1.0}
     elif kind == "free_to_col":
         _, cj, card = move
-        fi = find_free(card[0], card[1])
+        fi = find_free_cell_index(board, card[0], card[1])
         if fi is not None:
             board["free_cells"][fi] = None
         board[f"col{cj}"].append({"rank": card[0], "suit": card[1], "color": card_color(card[1]), "score": 1.0})
@@ -538,7 +529,7 @@ def _rank_trust_status(card):
     if not recognition:
         return "known"
     provenance = recognition.get("rank_provenance")
-    if provenance in ("template_confirmed", "corner_glyph_confirmed"):
+    if provenance in ("template_confirmed", "corner_glyph_confirmed", "cross_source_corroborated"):
         return "known"
     if provenance in ("conflicting_recognizers",):
         return "ambiguous"
@@ -879,7 +870,7 @@ def compare_normalized_state(expected_state, actual_normalized):
 
 def classify_verification_failure(expected_state, actual_normalized, previous_normalized=None):
     if actual_normalized is None:
-        return "another clearly documented cause"
+        return "board_read_failed"
     expected = state_to_data(expected_state)
     actual = actual_normalized["state_data"]
     previous = previous_normalized["state_data"] if previous_normalized else None
@@ -887,7 +878,7 @@ def classify_verification_failure(expected_state, actual_normalized, previous_no
         return "gesture_not_applied"
     if actual == expected:
         return "move_applied_but_verification_failed"
-    return "another clearly documented cause"
+    return "unrecognized_divergence"
 
 
 def read_and_normalize_board(screenshot_path, allow_best_effort=False, layout=None):
@@ -1080,24 +1071,30 @@ def choose_next_move(args, current_state, legal_moves, log_event):
     if not legal_moves:
         return None, {"reason": "no_legal_moves"}
 
-    ace_foundation_moves = [
-        move for move in legal_moves
-        if move[0] in ("col_to_found", "free_to_found") and move[-1][0] == "A"
-    ]
-    if ace_foundation_moves:
-        move = ace_foundation_moves[0]
-        log_event(
-            "solver_finished",
-            solver=args.solver,
-            duration_seconds=0.0,
-            candidate_moves=legal_moves,
-            selected_move=move,
-            selection_reason="safe_ace_foundation_priority",
-        )
-        return move, {
-            "reason": "safe_ace_foundation_priority",
-            "candidate_moves": legal_moves,
-        }
+    # The search solver already computes a multi-move path for the cycle;
+    # short-circuiting here would silently discard it and drop batching down
+    # to a single move (main()'s batch selection only uses selection["path"]
+    # when present). Only bypass the solver for solvers that never batch, so
+    # an obviously-safe ace move skips a solver call without losing a path.
+    if args.solver != "search":
+        ace_foundation_moves = [
+            move for move in legal_moves
+            if move[0] in ("col_to_found", "free_to_found") and move[-1][0] == "A"
+        ]
+        if ace_foundation_moves:
+            move = ace_foundation_moves[0]
+            log_event(
+                "solver_finished",
+                solver=args.solver,
+                duration_seconds=0.0,
+                candidate_moves=legal_moves,
+                selected_move=move,
+                selection_reason="safe_ace_foundation_priority",
+            )
+            return move, {
+                "reason": "safe_ace_foundation_priority",
+                "candidate_moves": legal_moves,
+            }
 
     if args.solver == "monte-carlo":
         print("[*] Running Monte Carlo move ranking...")
