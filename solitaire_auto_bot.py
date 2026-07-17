@@ -9,10 +9,10 @@ from dataclasses import asdict, dataclass
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+
+import cv2
 from board_reader_lib import (
-    read_board, TABLEAU_X, TABLEAU_Y_TOP, COL_WIDTH,
-    FREE_CELL_X, FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
-    HIDDEN_CARD_H, STEP, BoardLayout, save_calibration_artifacts,
+    read_board, BoardLayout, save_calibration_artifacts,
     save_exposed_card_diagnostics,
 )
 from freecell_solver import (
@@ -105,6 +105,60 @@ def assign_pseudo_suits(board):
 # ==============================================================================
 # 2. COORDINATE RESOLUTION
 # ==============================================================================
+def _round_point(point):
+    return {"x": int(round(point[0])), "y": int(round(point[1]))}
+
+
+def _bbox_data(x, y, w, h):
+    return {
+        "x": int(round(x)),
+        "y": int(round(y)),
+        "w": int(round(w)),
+        "h": int(round(h)),
+    }
+
+
+def _slot_bbox(layout, item_type, index):
+    if item_type == "free":
+        x = layout.free_cell_x[index]
+    elif item_type == "found":
+        foundation_index = min(index, len(layout.foundation_x) - 1)
+        x = layout.foundation_x[foundation_index]
+    else:
+        x = layout.tableau_x[index]
+    return _bbox_data(x, layout.slot_y, layout.slot_width, layout.slot_height)
+
+
+def _bbox_center(bbox):
+    return (
+        bbox["x"] + bbox["w"] / 2,
+        bbox["y"] + bbox["h"] / 2,
+    )
+
+
+def _original_point(normalized_point, transform):
+    if transform is None:
+        return normalized_point
+    return transform.normalized_to_original(*normalized_point)
+
+
+def _transform_log(transform):
+    if transform is None:
+        return None
+    return {
+        "scale_x": transform.scale_x,
+        "scale_y": transform.scale_y,
+        "content_x": transform.content_x,
+        "content_y": transform.content_y,
+        "content_width": transform.content_width,
+        "content_height": transform.content_height,
+        "original_width": transform.original_width,
+        "original_height": transform.original_height,
+        "reference_width": transform.reference_width,
+        "reference_height": transform.reference_height,
+    }
+
+
 def column_hidden_count(board, index):
     observed = board.get("observed_columns")
     if observed:
@@ -119,45 +173,134 @@ def column_visible_cards(board, index):
     return [c for c in board.get(f"col{index}", []) if not c.get("face_down")]
 
 
-def get_element_coords(board, item_type, index, transform=None, layout=None):
+def get_element_point(board, item_type, index, transform=None, layout=None, role="destination"):
     """
-    Calculates the exact center coordinate (x, y) for target slots or top cards.
+    Calculates normalized and original center coordinates for slots and cards.
     """
     layout = layout or BoardLayout()
+    bbox = None
+    source = None
     if item_type == "col":
-        hidden_count = column_hidden_count(board, index)
         visible_cards = column_visible_cards(board, index)
-        num_cards = hidden_count + len(visible_cards)
-        x_center = layout.tableau_x[index] + layout.column_width / 2
-        
-        if num_cards == 0:
-            # Empty column click target
-            y_center = layout.tableau_y_top + layout.slot_height / 2
+        top_bbox = visible_cards[-1].get("bbox") if visible_cards else None
+        if role == "source" and top_bbox:
+            bbox = dict(top_bbox)
+            bbox["h"] = min(bbox.get("h", layout.full_card_height), layout.slot_height)
+            source = "observed_card_bbox"
+        elif role == "destination" and top_bbox:
+            bbox = _bbox_data(
+                top_bbox["x"],
+                top_bbox["y"],
+                top_bbox["w"],
+                min(top_bbox.get("h", layout.full_card_height), layout.slot_height),
+            )
+            source = "observed_destination_card_bbox"
         else:
-            # Find Y position of the bottom revealed card (exposed card)
+            # No observed bbox for the top card (e.g. a card appended by
+            # apply_move_to_board's simulation-only bookkeeping) -- fall back
+            # to the calibrated stack position instead of assuming the top of
+            # the column, so cards stacked under hidden/revealed cards still
+            # get a plausible drop point.
+            hidden_count = column_hidden_count(board, index)
             revealed_count = len(visible_cards)
-            y_edge = layout.tableau_y_top + hidden_count * layout.hidden_card_step + max(0, revealed_count - 1) * layout.revealed_card_step
-            y_center = y_edge + layout.slot_height / 2
-        if transform is not None:
-            x_center, y_center = transform.normalized_to_original(x_center, y_center)
-        return int(round(x_center)), int(round(y_center))
-        
+            if hidden_count + revealed_count == 0:
+                y = layout.tableau_y_top
+                source = "calibrated_empty_column_slot"
+            else:
+                y = (
+                    layout.tableau_y_top
+                    + hidden_count * layout.hidden_card_step
+                    + max(0, revealed_count - 1) * layout.revealed_card_step
+                )
+                source = "calibrated_column_fallback"
+            bbox = _bbox_data(
+                layout.tableau_x[index],
+                y,
+                layout.column_width,
+                layout.slot_height,
+            )
+
     elif item_type == "free":
-        x_center = layout.free_cell_x[index] + layout.slot_width / 2
-        y_center = layout.slot_y + layout.slot_height / 2
-        if transform is not None:
-            x_center, y_center = transform.normalized_to_original(x_center, y_center)
-        return int(round(x_center)), int(round(y_center))
-        
+        bbox = _slot_bbox(layout, "free", index)
+        source = "calibrated_free_cell_slot"
+
     elif item_type == "found":
-        # We only have one foundation pile coordinates defined
-        x_center = layout.foundation_x[0] + layout.slot_width / 2
-        y_center = layout.slot_y + layout.slot_height / 2
-        if transform is not None:
-            x_center, y_center = transform.normalized_to_original(x_center, y_center)
-        return int(round(x_center)), int(round(y_center))
-        
-    return None
+        bbox = _slot_bbox(layout, "found", index)
+        source = "calibrated_foundation_slot"
+    else:
+        return None
+
+    normalized = _bbox_center(bbox)
+    original = _original_point(normalized, transform)
+    return {
+        "normalized": _round_point(normalized),
+        "original": _round_point(original),
+        "bbox": bbox,
+        "source": source,
+    }
+
+
+def get_element_coords(board, item_type, index, transform=None, layout=None):
+    point = get_element_point(board, item_type, index, transform=transform, layout=layout)
+    if point is None:
+        return None
+    original = point["original"]
+    return original["x"], original["y"]
+
+
+def plan_gesture(board, move, transform=None, layout=None):
+    layout = layout or BoardLayout()
+    kind = move[0]
+    card = move[-1]
+    start = None
+    end = None
+
+    if kind == "col_to_found":
+        _, ci, card = move
+        start = get_element_point(board, "col", ci, transform=transform, layout=layout, role="source")
+        end = get_element_point(board, "found", 0, transform=transform, layout=layout)
+    elif kind == "free_to_found":
+        _, card = move
+        fi = next((idx for idx, c in enumerate(board["free_cells"]) if c and c.get("rank") == card[0] and c.get("suit") == card[1]), None)
+        if fi is not None:
+            start = get_element_point(board, "free", fi, transform=transform, layout=layout, role="source")
+            end = get_element_point(board, "found", 0, transform=transform, layout=layout)
+    elif kind == "col_to_col":
+        _, ci, cj, card = move
+        start = get_element_point(board, "col", ci, transform=transform, layout=layout, role="source")
+        end = get_element_point(board, "col", cj, transform=transform, layout=layout)
+    elif kind == "col_to_free":
+        _, ci, card = move
+        fi = next((idx for idx, c in enumerate(board["free_cells"]) if c is None), None)
+        if fi is not None:
+            start = get_element_point(board, "col", ci, transform=transform, layout=layout, role="source")
+            end = get_element_point(board, "free", fi, transform=transform, layout=layout)
+    elif kind == "free_to_col":
+        _, cj, card = move
+        fi = next((idx for idx, c in enumerate(board["free_cells"]) if c and c.get("rank") == card[0] and c.get("suit") == card[1]), None)
+        if fi is not None:
+            start = get_element_point(board, "free", fi, transform=transform, layout=layout, role="source")
+            end = get_element_point(board, "col", cj, transform=transform, layout=layout)
+
+    if start is None or end is None:
+        return None
+
+    gesture = "tap" if kind in ("col_to_found", "free_to_found") else "swipe"
+    return {
+        "move": move,
+        "card": card,
+        "gesture": gesture,
+        "source_normalized": start["normalized"],
+        "source_original": start["original"],
+        "destination_normalized": end["normalized"],
+        "destination_original": end["original"],
+        "layout_profile": layout.to_json_data(),
+        "transform": _transform_log(transform),
+        "observed_source_bounding_box": start["bbox"],
+        "source_target": start["source"],
+        "destination_bounding_box_or_slot": end["bbox"],
+        "destination_target": end["source"],
+    }
 
 
 def card_color(suit):
@@ -222,8 +365,6 @@ def execute_move(board, move, sim_mode=False, event_logger=None, transform=None,
     kind = move[0]
     card = move[-1]
     emit = event_logger or (lambda event_name, **data: None)
-    start_coords = None
-    end_coords = None
     result = {
         "ok": False,
         "move": move,
@@ -233,51 +374,6 @@ def execute_move(board, move, sim_mode=False, event_logger=None, transform=None,
         "reason": None,
         "simulation": sim_mode,
     }
-
-    if kind == "col_to_found":
-        _, ci, card = move
-        start_coords = get_element_coords(board, "col", ci, transform=transform, layout=layout)
-        end_coords = get_element_coords(board, "found", 0, transform=transform, layout=layout)
-        
-    elif kind == "free_to_found":
-        _, card = move
-        # Locate the free cell index carrying this card
-        fi = None
-        for idx, c in enumerate(board["free_cells"]):
-            if c and c.get("rank") == card[0] and c.get("suit") == card[1]:
-                fi = idx
-                break
-        if fi is not None:
-            start_coords = get_element_coords(board, "free", fi, transform=transform, layout=layout)
-            end_coords = get_element_coords(board, "found", 0, transform=transform, layout=layout)
-            
-    elif kind == "col_to_col":
-        _, ci, cj, card = move
-        start_coords = get_element_coords(board, "col", ci, transform=transform, layout=layout)
-        end_coords = get_element_coords(board, "col", cj, transform=transform, layout=layout)
-        
-    elif kind == "col_to_free":
-        _, ci, card = move
-        # Locate first empty free cell
-        fi = None
-        for idx, c in enumerate(board["free_cells"]):
-            if c is None:
-                fi = idx
-                break
-        if fi is not None:
-            start_coords = get_element_coords(board, "col", ci, transform=transform, layout=layout)
-            end_coords = get_element_coords(board, "free", fi, transform=transform, layout=layout)
-            
-    elif kind == "free_to_col":
-        _, cj, card = move
-        fi = None
-        for idx, c in enumerate(board["free_cells"]):
-            if c and c.get("rank") == card[0] and c.get("suit") == card[1]:
-                fi = idx
-                break
-        if fi is not None:
-            start_coords = get_element_coords(board, "free", fi, transform=transform, layout=layout)
-            end_coords = get_element_coords(board, "col", cj, transform=transform, layout=layout)
 
     # Sanity-check: for moves that pop the top of a tableau column, make sure
     # the physical top card actually matches what the solver believes is
@@ -305,39 +401,29 @@ def execute_move(board, move, sim_mode=False, event_logger=None, transform=None,
             result["expected_card"] = card
             return result
 
-    if start_coords and end_coords:
-        x1, y1 = start_coords
-        x2, y2 = end_coords
-        result["start"] = {"x": x1, "y": y1}
-        result["end"] = {"x": x2, "y": y2}
-        if kind in ("col_to_found", "free_to_found"):
-            result["gesture"] = "tap"
+    plan = plan_gesture(board, move, transform=transform, layout=layout)
+    if plan:
+        x1 = plan["source_original"]["x"]
+        y1 = plan["source_original"]["y"]
+        x2 = plan["destination_original"]["x"]
+        y2 = plan["destination_original"]["y"]
+        result["gesture"] = plan["gesture"]
+        result["start"] = plan["source_original"]
+        result["end"] = plan["destination_original"]
+        result["gesture_plan"] = plan
+        if plan["gesture"] == "tap":
             print(f"[*] Action: Tap to Foundation: {card} at ({x1}, {y1})")
-            emit(
-                "gesture_planned",
-                move=move,
-                gesture="tap",
-                start={"x": x1, "y": y1},
-                simulation=sim_mode,
-            )
+            emit("gesture_planned", **plan, start=plan["source_original"], simulation=sim_mode)
             if sim_mode:
                 print(f"   [Simulation] Would tap: bridge.tap({x1}, {y1})")
             else:
                 bridge.tap(x1, y1)
         else:
-            result["gesture"] = "swipe"
             print(
                 f"[*] Action: Move {kind.replace('_', ' ')}: {card} "
                 f"from ({x1}, {y1}) to ({x2}, {y2})"
             )
-            emit(
-                "gesture_planned",
-                move=move,
-                gesture="swipe",
-                start={"x": x1, "y": y1},
-                end={"x": x2, "y": y2},
-                simulation=sim_mode,
-            )
+            emit("gesture_planned", **plan, start=plan["source_original"], end=plan["destination_original"], simulation=sim_mode)
             if sim_mode:
                 print(f"   [Simulation] Would swipe: bridge.swipe({x1}, {y1}, {x2}, {y2})")
             else:
@@ -437,11 +523,28 @@ def build_expected_transition(previous_normalized, move):
 def _identity_status(card):
     if card is None:
         return "empty"
+    rank_status = _rank_trust_status(card)
+    if rank_status in ("unresolved", "ambiguous"):
+        return rank_status
     if card.get("rank") == "?" or card.get("color") == "?" or card.get("suit_source") == "unresolved":
         return "unresolved"
     if card.get("suit_source") == "ambiguous" or card.get("suit") not in ("S", "H", "D", "C"):
         return "ambiguous"
     return "known"
+
+
+def _rank_trust_status(card):
+    recognition = card.get("recognition") if card else None
+    if not recognition:
+        return "known"
+    provenance = recognition.get("rank_provenance")
+    if provenance in ("template_confirmed", "corner_glyph_confirmed"):
+        return "known"
+    if provenance in ("conflicting_recognizers",):
+        return "ambiguous"
+    if provenance in ("shape_heuristic_only", "unresolved"):
+        return "unresolved"
+    return "unresolved"
 
 
 def _top_visible_card(normalized, column_index):
@@ -639,8 +742,20 @@ def build_normalized_state(board, allow_best_effort=False):
                 continue
             visible_cards.append(card)
             source = card.get("suit_source")
+            rank_status = _rank_trust_status(card)
             if card.get("rank") == "?" or card.get("color") == "?":
                 note_card(f"col{idx}", card_index, card, "unresolved")
+                if not allow_best_effort:
+                    break
+                continue
+            if rank_status == "unresolved":
+                note_card(f"col{idx}", card_index, card, "unresolved")
+                if not allow_best_effort:
+                    break
+                continue
+            if rank_status == "ambiguous":
+                note_card(f"col{idx}", card_index, card, "ambiguous")
+                truncated_columns.append(idx)
                 if not allow_best_effort:
                     break
                 continue
@@ -662,9 +777,10 @@ def build_normalized_state(board, allow_best_effort=False):
         if not card:
             continue
         source = card.get("suit_source")
-        if card.get("rank") == "?" or card.get("color") == "?":
+        rank_status = _rank_trust_status(card)
+        if card.get("rank") == "?" or card.get("color") == "?" or rank_status == "unresolved":
             note_card("free_cells", idx, card, "unresolved")
-        elif source == "ambiguous" or card.get("suit") not in ("S", "H", "D", "C"):
+        elif source == "ambiguous" or rank_status == "ambiguous" or card.get("suit") not in ("S", "H", "D", "C"):
             note_card("free_cells", idx, card, "ambiguous")
         else:
             free.append((card["rank"], card["suit"]))
@@ -674,9 +790,10 @@ def build_normalized_state(board, allow_best_effort=False):
         if not card:
             continue
         source = card.get("suit_source")
-        if card.get("rank") == "?" or card.get("color") == "?":
+        rank_status = _rank_trust_status(card)
+        if card.get("rank") == "?" or card.get("color") == "?" or rank_status == "unresolved":
             note_card("foundation", idx, card, "unresolved")
-        elif source == "ambiguous" or card.get("suit") not in ("S", "H", "D", "C"):
+        elif source == "ambiguous" or rank_status == "ambiguous" or card.get("suit") not in ("S", "H", "D", "C"):
             note_card("foundation", idx, card, "ambiguous")
         else:
             found[card["suit"]] = rank_val(card["rank"])
@@ -760,6 +877,19 @@ def compare_normalized_state(expected_state, actual_normalized):
     }
 
 
+def classify_verification_failure(expected_state, actual_normalized, previous_normalized=None):
+    if actual_normalized is None:
+        return "another clearly documented cause"
+    expected = state_to_data(expected_state)
+    actual = actual_normalized["state_data"]
+    previous = previous_normalized["state_data"] if previous_normalized else None
+    if previous is not None and actual == previous and actual != expected:
+        return "gesture_not_applied"
+    if actual == expected:
+        return "move_applied_but_verification_failed"
+    return "another clearly documented cause"
+
+
 def read_and_normalize_board(screenshot_path, allow_best_effort=False, layout=None):
     read_result = read_board(str(screenshot_path), layout=layout, include_metadata=True)
     normalized = build_normalized_state(read_result["board"], allow_best_effort=allow_best_effort)
@@ -780,6 +910,26 @@ def capture_live_screenshot(path):
 
 def write_json(path, data):
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def draw_gesture_preview(screenshot_path, gesture_plan, output_path):
+    image = cv2.imread(str(screenshot_path))
+    if image is None:
+        raise FileNotFoundError(screenshot_path)
+    source = gesture_plan["source_original"]
+    dest = gesture_plan["destination_original"]
+    start = (int(source["x"]), int(source["y"]))
+    end = (int(dest["x"]), int(dest["y"]))
+    cv2.arrowedLine(image, start, end, (0, 255, 255), 5, tipLength=0.08)
+    cv2.circle(image, start, 14, (0, 0, 255), -1)
+    cv2.circle(image, end, 14, (255, 0, 0), -1)
+    cv2.putText(image, "source", (start[0] + 16, start[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    cv2.putText(image, "destination", (end[0] + 16, end[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(out), image):
+        raise RuntimeError(f"failed to write preview image: {out}")
+    return out
 
 
 def failure_artifact_dir():
@@ -854,6 +1004,7 @@ def verify_expected_state(
     screenshot_prefix,
     event_logger=None,
     expected_transition=None,
+    previous_normalized=None,
 ):
     emit = event_logger or (lambda event_name, **data: None)
     screenshots = []
@@ -886,6 +1037,12 @@ def verify_expected_state(
                 final_report = compare_expected_transition(expected_transition, final_actual)
             else:
                 final_report = compare_normalized_state(expected_state, final_actual)
+            if not final_report["matches"]:
+                final_report["classification"] = classify_verification_failure(
+                    expected_state,
+                    final_actual,
+                    previous_normalized=previous_normalized,
+                )
         except Exception as exc:
             final_report = {
                 "matches": False,
@@ -922,6 +1079,25 @@ def verify_expected_state(
 def choose_next_move(args, current_state, legal_moves, log_event):
     if not legal_moves:
         return None, {"reason": "no_legal_moves"}
+
+    ace_foundation_moves = [
+        move for move in legal_moves
+        if move[0] in ("col_to_found", "free_to_found") and move[-1][0] == "A"
+    ]
+    if ace_foundation_moves:
+        move = ace_foundation_moves[0]
+        log_event(
+            "solver_finished",
+            solver=args.solver,
+            duration_seconds=0.0,
+            candidate_moves=legal_moves,
+            selected_move=move,
+            selection_reason="safe_ace_foundation_priority",
+        )
+        return move, {
+            "reason": "safe_ace_foundation_priority",
+            "candidate_moves": legal_moves,
+        }
 
     if args.solver == "monte-carlo":
         print("[*] Running Monte Carlo move ranking...")
@@ -1087,6 +1263,11 @@ def main():
         default=[],
         metavar="COLUMN,INDEX",
         help="Write targeted diagnostics for an exposed tableau card and exit without gestures. Repeatable.",
+    )
+    parser.add_argument(
+        "--preview-gesture",
+        type=str,
+        help="Draw the selected gesture over the original screenshot and exit without executing it.",
     )
     args = parser.parse_args()
 
@@ -1389,6 +1570,25 @@ def main():
                 expected_transition=expected_transition.to_json_data(),
             )
 
+            if args.preview_gesture:
+                plan = plan_gesture(
+                    board,
+                    move,
+                    transform=normalized.get("transform"),
+                    layout=normalized.get("layout"),
+                )
+                if plan is None:
+                    print(f"[Error] Failed to resolve preview coordinates for move: {move}", file=sys.stderr)
+                    log_event("move_rejected", cycle=cycle_number, move=move, reason="coordinate_resolution_failed")
+                    break
+                preview_path = draw_gesture_preview(before_screenshot, plan, args.preview_gesture)
+                log_event("gesture_preview_written", cycle=cycle_number, path=preview_path, gesture_plan=plan)
+                print(f"[*] Gesture preview written to: {preview_path}")
+                print(f"[*] Preview move: {move}")
+                print(f"[*] Source normalized: {plan['source_normalized']} original: {plan['source_original']}")
+                print(f"[*] Destination normalized: {plan['destination_normalized']} original: {plan['destination_original']}")
+                break
+
             if sim_mode and args.solver == "search" and selection.get("path"):
                 batch = selection["path"] if args.moves_per_cycle <= 0 else selection["path"][:args.moves_per_cycle]
             else:
@@ -1444,6 +1644,7 @@ def main():
             verification = verify_expected_state(
                 expected_state=expected_state,
                 expected_transition=expected_transition,
+                previous_normalized=normalized,
                 allow_best_effort=False,
                 attempts=max(1, args.verify_attempts),
                 delay=max(0.0, args.verify_delay),

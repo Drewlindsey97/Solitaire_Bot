@@ -16,8 +16,10 @@ from monte_carlo_solver import choose_move_monte_carlo
 from solitaire_auto_bot import (
     build_expected_transition,
     build_normalized_state,
+    classify_verification_failure,
     compare_expected_transition,
     compare_normalized_state,
+    choose_next_move,
     filter_safe_legal_moves,
     save_failure_artifacts,
     state_to_data,
@@ -38,6 +40,24 @@ def card(rank, suit=None, color=None):
     payload = {"rank": rank, "color": color, "score": 1.0}
     if suit:
         payload["suit"] = suit
+    return payload
+
+
+def recognized_card(rank, suit, provenance, selected_source="rank_corner", score=0.9):
+    payload = card(rank, suit)
+    payload["recognition"] = {
+        "rank_provenance": provenance,
+        "selected_source": selected_source,
+        "attempts": [
+            {
+                "source": selected_source,
+                "rank": rank,
+                "score": score,
+                "margin": 0.2,
+                "candidates": [{"rank": rank, "score": score, "variant": "test"}],
+            }
+        ],
+    }
     return payload
 
 
@@ -377,6 +397,60 @@ class MoveLoopTests(unittest.TestCase):
         self.assertEqual(normalized["board"]["col0"][1]["suit_source"], "resolved_by_constraints")
         self.assertEqual(normalized["board"]["col0"][3]["suit_source"], "ambiguous")
 
+    def test_heuristic_only_rank_is_not_live_trustworthy(self):
+        board = empty_board()
+        board["col0"] = [recognized_card("Q", "S", "shape_heuristic_only", selected_source="live_shape_heuristic")]
+
+        normalized = build_normalized_state(board)
+
+        self.assertFalse(normalized["trustworthy"])
+        self.assertEqual(normalized["unresolved_cards"][0]["reason"], "unresolved")
+        self.assertEqual(normalized["columns"][0], [])
+
+    def test_disagreement_between_rank_recognizers_makes_card_ambiguous(self):
+        board = empty_board()
+        board["col0"] = [recognized_card("5", "S", "conflicting_recognizers")]
+
+        normalized = build_normalized_state(board)
+
+        self.assertFalse(normalized["trustworthy"])
+        self.assertEqual(normalized["ambiguous_cards"][0]["reason"], "ambiguous")
+        self.assertEqual(normalized["columns"][0], [])
+
+    def test_incorrect_high_heuristic_score_does_not_produce_trustworthy_state(self):
+        board = empty_board()
+        bad = recognized_card("Q", "S", "shape_heuristic_only", selected_source="live_shape_heuristic", score=0.99)
+        board["col0"] = [bad]
+
+        normalized = build_normalized_state(board)
+
+        self.assertFalse(normalized["trustworthy"])
+        self.assertEqual(normalized["unresolved_cards"][0]["card"]["recognition"]["rank_provenance"], "shape_heuristic_only")
+
+    def test_visually_confirmed_ace_produces_foundation_move(self):
+        board = empty_board()
+        board["col0"] = [recognized_card("A", "S", "corner_glyph_confirmed", selected_source="ace_corner_detector")]
+
+        normalized = build_normalized_state(board)
+        legal, _, _ = filter_safe_legal_moves(generate_complete_moves(normalized["state"]), normalized)
+
+        self.assertTrue(normalized["trustworthy"])
+        self.assertIn(("col_to_found", 0, ("A", "S")), legal)
+
+    def test_safe_ace_to_foundation_is_selected_before_col_to_free(self):
+        state = State([[("A", "S")], [("K", "H")], [], [], [], [], []], [], {})
+        legal_moves = generate_complete_moves(state)
+
+        selected, selection = choose_next_move(
+            SimpleNamespace(solver="monte-carlo"),
+            state,
+            legal_moves,
+            lambda *args, **kwargs: None,
+        )
+
+        self.assertEqual(selected, ("col_to_found", 0, ("A", "S")))
+        self.assertEqual(selection["reason"], "safe_ace_foundation_priority")
+
     def test_hidden_cards_do_not_make_state_untrusted(self):
         board = empty_board()
         board["col0"] = [hidden_card(), hidden_card(), card("K", "S")]
@@ -387,6 +461,21 @@ class MoveLoopTests(unittest.TestCase):
         self.assertEqual(normalized["hidden_counts"], [2, 0, 0, 0, 0, 0, 0])
         self.assertEqual(normalized["unresolved_exposed_count"], 0)
         self.assertEqual(normalized["columns"][0], [("K", "S")])
+
+    def test_verification_classifies_unchanged_board_as_gesture_not_applied(self):
+        previous_state = State([[("5", "S")], [], [], [], [], [], []], [], {})
+        expected_state = apply_move(previous_state, ("col_to_free", 0, ("5", "S")))
+        previous = {
+            "state_data": state_to_data(previous_state),
+        }
+        actual = {
+            "state_data": state_to_data(previous_state),
+        }
+
+        self.assertEqual(
+            classify_verification_failure(expected_state, actual, previous_normalized=previous),
+            "gesture_not_applied",
+        )
 
     def test_unresolved_exposed_card_makes_state_untrusted(self):
         board = empty_board()

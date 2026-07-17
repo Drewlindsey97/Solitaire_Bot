@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import tempfile
+import inspect
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from board_reader_lib import (
     BoardLayout,
     BoardTransform,
     TEMPLATES,
+    assess_rank_attempts,
     match_rank_detailed,
     preprocess_rank_variants,
     read_board,
@@ -20,6 +22,8 @@ from board_reader_lib import (
     transform_from_content_rect,
 )
 from solitaire_auto_bot import get_element_coords, main
+import solitaire_auto_bot
+from solitaire_auto_bot import plan_gesture
 
 
 def synthetic_image(width=720, height=1600, content_rect=None):
@@ -33,6 +37,19 @@ def synthetic_image(width=720, height=1600, content_rect=None):
 
 
 class BoardLayoutTests(unittest.TestCase):
+    def calibrated_board(self):
+        board = {f"col{i}": [] for i in range(7)}
+        board["col0"] = [{
+            "rank": "5",
+            "color": "BLACK",
+            "suit": "S",
+            "score": 1.0,
+            "bbox": {"x": 10, "y": 636, "w": 95, "h": 135},
+        }]
+        board["free_cells"] = [None, None, None, None]
+        board["foundation"] = [None]
+        return board
+
     def test_reference_resolution(self):
         layout = BoardLayout()
         transform = transform_from_content_rect(720, 1600, (0, 0, 720, 1600), layout)
@@ -67,6 +84,136 @@ class BoardLayoutTests(unittest.TestCase):
         board["col0"] = [{"rank": "A", "color": "RED", "score": 1.0}]
         coords = get_element_coords(board, "col", 0, transform=transform, layout=layout)
         self.assertEqual(coords, (115, 1104))
+
+    def test_calibrated_col0_to_free_mapping(self):
+        layout = BoardLayout(tableau_y_top=636, slot_y=395, hidden_card_step=20, revealed_card_step=50)
+        transform = transform_from_content_rect(720, 1600, (0, 0, 720, 1600), layout)
+        plan = plan_gesture(self.calibrated_board(), ("col_to_free", 0, ("5", "S")), transform=transform, layout=layout)
+
+        self.assertEqual(plan["source_normalized"], {"x": 58, "y": 681})
+        self.assertEqual(plan["destination_normalized"], {"x": 58, "y": 440})
+        self.assertEqual(plan["source_original"], {"x": 58, "y": 681})
+        self.assertEqual(plan["destination_original"], {"x": 58, "y": 440})
+
+    def test_calibrated_tableau_source_coordinate_uses_observed_bbox(self):
+        layout = BoardLayout(tableau_y_top=636, slot_y=395)
+        plan = plan_gesture(self.calibrated_board(), ("col_to_free", 0, ("5", "S")), layout=layout)
+
+        self.assertEqual(plan["source_target"], "observed_card_bbox")
+        self.assertEqual(plan["observed_source_bounding_box"], {"x": 10, "y": 636, "w": 95, "h": 90})
+        self.assertNotEqual(plan["source_normalized"]["y"], 552)
+
+    def test_calibrated_free_cell_destination_coordinate(self):
+        layout = BoardLayout(tableau_y_top=636, slot_y=395)
+        plan = plan_gesture(self.calibrated_board(), ("col_to_free", 0, ("5", "S")), layout=layout)
+
+        self.assertEqual(plan["destination_target"], "calibrated_free_cell_slot")
+        self.assertEqual(plan["destination_bounding_box_or_slot"], {"x": 10, "y": 395, "w": 95, "h": 90})
+        self.assertEqual(plan["destination_normalized"], {"x": 58, "y": 440})
+
+    def test_padded_scaled_screenshot_gesture_mapping(self):
+        layout = BoardLayout(tableau_y_top=636, slot_y=395)
+        transform = transform_from_content_rect(1440, 3400, (0, 100, 1440, 3200), layout)
+        plan = plan_gesture(self.calibrated_board(), ("col_to_free", 0, ("5", "S")), transform=transform, layout=layout)
+
+        self.assertEqual(plan["source_original"], {"x": 115, "y": 1462})
+        self.assertEqual(plan["destination_original"], {"x": 115, "y": 980})
+        self.assertEqual(plan["transform"]["content_y"], 100)
+        self.assertEqual(plan["transform"]["scale_y"], 0.5)
+
+    def test_ace_corner_detector_confirmed_without_competing_signal(self):
+        attempts = [
+            {"source": "ace_corner_detector", "rank": "A", "score": 0.96, "candidates": [{"score": 0.96}]},
+            {"source": "rank_corner", "rank": "A", "score": 0.4, "candidates": [{"score": 0.4}, {"score": 0.3}]},
+        ]
+
+        rank, score, provenance, _ = assess_rank_attempts(attempts)
+
+        self.assertEqual(rank, "A")
+        self.assertEqual(provenance, "corner_glyph_confirmed")
+
+    def test_ace_corner_detector_does_not_override_a_plausible_competing_rank(self):
+        # The corner glyph detector's own "score" is a fixed constant, not a
+        # real confidence measure, so it must not auto-confirm "A" when
+        # another recognizer plausibly identifies a different rank.
+        attempts = [
+            {"source": "ace_corner_detector", "rank": "A", "score": 0.96, "candidates": [{"score": 0.96}]},
+            {"source": "rank_corner", "rank": "6", "score": 0.7, "candidates": [{"score": 0.7}, {"score": 0.3}]},
+        ]
+
+        rank, score, provenance, _ = assess_rank_attempts(attempts)
+
+        self.assertNotEqual(provenance, "corner_glyph_confirmed")
+
+    def test_tableau_fallback_accounts_for_hidden_and_revealed_stack_when_bbox_missing(self):
+        # apply_move_to_board() appends simulation-only cards with no "bbox"
+        # key; the fallback must still offset by hidden/revealed card steps
+        # instead of collapsing to tableau_y_top as if the column were empty.
+        layout = BoardLayout(tableau_y_top=600, hidden_card_step=20, revealed_card_step=50)
+        board = {f"col{i}": [] for i in range(7)}
+        board["col0"] = [
+            {"face_down": True},
+            {"face_down": True},
+            {"rank": "5", "suit": "S", "color": "BLACK", "score": 1.0},
+        ]
+        board["free_cells"] = [None, None, None, None]
+        board["foundation"] = [None]
+
+        plan = plan_gesture(board, ("col_to_free", 0, ("5", "S")), layout=layout)
+
+        expected_y = layout.tableau_y_top + 2 * layout.hidden_card_step
+        self.assertEqual(plan["source_target"], "calibrated_column_fallback")
+        self.assertEqual(plan["observed_source_bounding_box"]["y"], expected_y)
+        self.assertNotEqual(plan["observed_source_bounding_box"]["y"], layout.tableau_y_top)
+
+    def test_no_move_executor_uses_obsolete_hard_coded_y_coordinates(self):
+        source = inspect.getsource(solitaire_auto_bot.execute_move) + inspect.getsource(solitaire_auto_bot.plan_gesture)
+        for obsolete in ("507", "303", "552", "348"):
+            self.assertNotIn(obsolete, source)
+
+    def test_preview_mode_never_executes_gesture(self):
+        layout = BoardLayout(tableau_y_top=636, slot_y=395)
+        transform = transform_from_content_rect(720, 1600, (0, 0, 720, 1600), layout)
+        state = solitaire_auto_bot.State([[("5", "S")], [], [], [], [], [], []], [], {})
+        board = self.calibrated_board()
+        normalized = {
+            "board": board,
+            "state": state,
+            "state_data": solitaire_auto_bot.state_to_data(state),
+            "columns": [[("5", "S")], [], [], [], [], [], []],
+            "free": [],
+            "foundations": {},
+            "observed_columns": [{"hidden_count": 0, "visible_cards": board[f"col{i}"]} for i in range(7)],
+            "unresolved_cards": [],
+            "ambiguous_cards": [],
+            "truncated_columns": [],
+            "trustworthy": True,
+            "trust_status": "trustworthy",
+            "layout": layout,
+            "transform": transform,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            screenshot = Path(temp_dir) / "screen.png"
+            preview = Path(temp_dir) / "preview.png"
+            cv2.imwrite(str(screenshot), synthetic_image())
+            argv = [
+                "solitaire_auto_bot.py",
+                "--sim",
+                str(screenshot),
+                "--solver",
+                "monte-carlo",
+                "--preview-gesture",
+                str(preview),
+            ]
+            with patch("sys.argv", argv), \
+                    patch("solitaire_auto_bot.read_and_normalize_board", return_value=normalized), \
+                    patch("solitaire_auto_bot.choose_next_move", return_value=(("col_to_free", 0, ("5", "S")), {"reason": "test"})), \
+                    patch("bridge.tap") as tap, \
+                    patch("bridge.swipe") as swipe:
+                main()
+            tap.assert_not_called()
+            swipe.assert_not_called()
+            self.assertTrue(preview.exists())
 
     def test_crop_bounds_for_padded_screenshot(self):
         layout = BoardLayout()

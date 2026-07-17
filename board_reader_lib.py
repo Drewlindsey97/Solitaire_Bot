@@ -234,6 +234,133 @@ def match_rank_detailed(patch, template_set):
     return best_name, best_score, ranked
 
 
+def _candidate_margin(candidates: list[dict[str, Any]]) -> float:
+    if len(candidates) < 2:
+        return 1.0
+    return float(candidates[0]["score"]) - float(candidates[1]["score"])
+
+
+def detect_ace_from_rank_corner(patch):
+    if patch.size == 0:
+        return None
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    mask = (gray < 180).astype("uint8") * 255
+    contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return None
+    hierarchy = hierarchy[0]
+    candidates = []
+    for idx, contour in enumerate(contours):
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        if area < 250 or not (18 <= w <= 30 and 24 <= h <= 34 and 5 <= x <= 16 and 5 <= y <= 12):
+            continue
+        child_indices = [child_idx for child_idx, item in enumerate(hierarchy) if item[3] == idx]
+        if len(child_indices) != 1:
+            continue
+        child = contours[child_indices[0]]
+        cx, cy, cw, ch = cv2.boundingRect(child)
+        child_area = cv2.contourArea(child)
+        if not (5 <= cw <= 10 and 9 <= ch <= 15 and 25 <= child_area <= 70):
+            continue
+        if cy - y > 8:
+            continue
+        score = 0.96
+        candidates.append({
+            "rank": "A",
+            "score": score,
+            "variant": "corner_a_glyph_hole",
+            "bbox": {"x": x, "y": y, "w": w, "h": h},
+            "hole_bbox": {"x": cx, "y": cy, "w": cw, "h": ch},
+        })
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return {
+        "rank": "A",
+        "score": candidates[0]["score"],
+        "candidates": candidates,
+    }
+
+
+def assess_rank_attempts(attempts):
+    usable = []
+    exact_threshold = 0.96
+    min_signal_score = 0.55
+    min_margin = 0.08
+    for attempt in attempts:
+        source = attempt["source"]
+        score = float(attempt["score"])
+        margin = _candidate_margin(attempt.get("candidates", []))
+        enriched = {**attempt, "margin": margin}
+        if source == "ace_corner_detector":
+            usable.append(enriched)
+        elif source in ("full_last_card", "rank_corner"):
+            if score >= exact_threshold:
+                usable.append(enriched)
+            elif score >= min_signal_score and margin >= min_margin:
+                usable.append(enriched)
+        elif source == "live_shape_heuristic" and score >= 0.88:
+            usable.append(enriched)
+
+    by_rank: dict[str, list[dict[str, Any]]] = {}
+    for attempt in usable:
+        by_rank.setdefault(attempt["rank"], []).append(attempt)
+
+    exact = [
+        attempt for attempt in usable
+        if attempt["source"] in ("full_last_card", "rank_corner") and attempt["score"] >= exact_threshold
+    ]
+    if exact:
+        exact.sort(key=lambda item: item["score"], reverse=True)
+        best = exact[0]
+        return best["rank"], best["score"], "template_confirmed", usable
+
+    ace = by_rank.get("A", [])
+    competing_rank_signal = any(
+        attempt["rank"] != "A"
+        and attempt["source"] in ("full_last_card", "rank_corner")
+        and attempt["score"] >= min_signal_score
+        for attempt in usable
+    )
+    if (
+        ace
+        and not competing_rank_signal
+        and any(item["source"] == "ace_corner_detector" and item["score"] >= 0.95 for item in ace)
+    ):
+        best = max(ace, key=lambda item: item["score"])
+        return "A", best["score"], "corner_glyph_confirmed", usable
+
+    corroborated = [
+        (rank, rank_attempts)
+        for rank, rank_attempts in by_rank.items()
+        if len({item["source"] for item in rank_attempts}) >= 2
+    ]
+    if corroborated:
+        corroborated.sort(key=lambda item: max(attempt["score"] for attempt in item[1]), reverse=True)
+        rank, rank_attempts = corroborated[0]
+        if len(corroborated) > 1:
+            return rank, max(item["score"] for item in rank_attempts), "conflicting_recognizers", usable
+        best_score = max(item["score"] for item in rank_attempts)
+        return rank, best_score, "template_confirmed", usable
+
+    if len(by_rank) > 1:
+        ranked = sorted(by_rank.items(), key=lambda item: max(attempt["score"] for attempt in item[1]), reverse=True)
+        rank, rank_attempts = ranked[0]
+        return rank, max(item["score"] for item in rank_attempts), "conflicting_recognizers", usable
+
+    if usable:
+        best = max(usable, key=lambda item: item["score"])
+        provenance = "shape_heuristic_only" if best["source"] == "live_shape_heuristic" else "unresolved"
+        return best["rank"], best["score"], provenance, usable
+
+    if attempts:
+        best = max(attempts, key=lambda item: item["score"])
+        return best["rank"], best["score"], "unresolved", usable
+
+    return "?", 0.0, "unresolved", usable
+
+
 def recognize_card_rank(img, x, y, is_last, layout: BoardLayout):
     attempts = []
     if is_last:
@@ -241,6 +368,14 @@ def recognize_card_rank(img, x, y, is_last, layout: BoardLayout):
         name, score, ranked = match_rank_detailed(full_patch, TEMPLATES_LAST)
         attempts.append({"source": "full_last_card", "rank": name, "score": score, "candidates": ranked})
         corner_patch = _safe_crop(img, x, y, layout.rank_width, layout.rank_height)
+        ace = detect_ace_from_rank_corner(corner_patch)
+        if ace is not None:
+            attempts.append({
+                "source": "ace_corner_detector",
+                "rank": ace["rank"],
+                "score": ace["score"],
+                "candidates": ace["candidates"],
+            })
         name, score, ranked = match_rank_detailed(corner_patch, TEMPLATES)
         attempts.append({"source": "rank_corner", "rank": name, "score": score, "candidates": ranked})
         heuristic = live_shape_rank_heuristic(full_patch)
@@ -253,16 +388,31 @@ def recognize_card_rank(img, x, y, is_last, layout: BoardLayout):
             })
     else:
         corner_patch = _safe_crop(img, x, y, layout.rank_width, layout.rank_height)
+        ace = detect_ace_from_rank_corner(corner_patch)
+        if ace is not None:
+            attempts.append({
+                "source": "ace_corner_detector",
+                "rank": ace["rank"],
+                "score": ace["score"],
+                "candidates": ace["candidates"],
+            })
         name, score, ranked = match_rank_detailed(corner_patch, TEMPLATES)
         attempts.append({"source": "rank_corner", "rank": name, "score": score, "candidates": ranked})
-    best = max(attempts, key=lambda item: item["score"])
-    return best["rank"], best["score"], {
-        "selected_source": best["source"],
+    rank, score, provenance, usable = assess_rank_attempts(attempts)
+    selected = max(
+        [item for item in attempts if item["rank"] == rank] or attempts,
+        key=lambda item: item["score"],
+    )
+    return rank, score, {
+        "selected_source": selected["source"],
+        "rank_provenance": provenance,
+        "corroborating_sources": [item["source"] for item in usable if item["rank"] == rank],
         "attempts": [
             {
                 "source": item["source"],
                 "rank": item["rank"],
                 "score": round(float(item["score"]), 4),
+                "margin": round(float(_candidate_margin(item.get("candidates", []))), 4),
                 "candidates": item["candidates"][:10],
             }
             for item in attempts
@@ -489,6 +639,12 @@ def _scan_rows_for_column(
             "score": 0.0,
             "face_down": True,
             "provenance": "hidden_face_down",
+            "bbox": {
+                "x": x,
+                "y": y,
+                "w": layout.column_width,
+                "h": hidden_step,
+            },
         })
         report["rows"].append({"kind": "hidden", "y": y})
 
@@ -524,6 +680,12 @@ def _scan_rows_for_column(
             "provenance": "ocr_visible",
             "recognition": rank_details,
             "color_candidates": color_candidates,
+            "bbox": {
+                "x": x,
+                "y": y,
+                "w": layout.column_width,
+                "h": layout.full_card_height if is_last else layout.revealed_card_step,
+            },
         }
         cards.append(card)
         report["rows"].append({
