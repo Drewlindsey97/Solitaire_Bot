@@ -36,6 +36,14 @@ def assign_pseudo_suits(board):
     def process_card(card):
         if card is None or card.get("rank") == "?" or card.get("color") == "?":
             return
+        # board_reader_lib now reads the real suit from the card's suit pip;
+        # only fall back to alternating pseudo-suits when that read is
+        # missing. Pseudo-suits are assigned by scan-order encounter, which
+        # isn't stable across board-read cycles (a same-rank same-color
+        # card can flip S<->C or H<->D between reads), causing solver
+        # desync - a real suit read doesn't have that problem.
+        if card.get("suit") in ("S", "H", "D", "C"):
+            return
         rank = card["rank"]
         color = card["color"]
         
