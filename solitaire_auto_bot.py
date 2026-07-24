@@ -574,7 +574,7 @@ def main():
             else:
                 print("[*] Searching for a path...")
                 solver_started = time.perf_counter()
-                path, explored, solved = solve(
+                path, explored, solved, status = solve(
                     cols,
                     initial_free=free,
                     initial_found=found,
@@ -588,6 +588,7 @@ def main():
                     duration_seconds=solver_seconds,
                     explored_states=explored,
                     solved=solved,
+                    status=status,
                     path_length=len(path),
                     path=path,
                 )

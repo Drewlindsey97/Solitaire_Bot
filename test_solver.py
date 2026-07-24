@@ -11,10 +11,10 @@ cols = [
     [],
 ]
 
-path, explored, solved = solve(cols)
+path, explored, solved, status = solve(cols)
 
-if path is None:
-    print(f"No solution found (explored {explored} states)")
+if not solved:
+    print(f"No solution found ({status}, explored {explored} states)")
 else:
     print(f"Solved in {len(path)} moves (explored {explored} states):")
     for m in path:
