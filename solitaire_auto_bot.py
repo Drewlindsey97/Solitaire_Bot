@@ -7,10 +7,10 @@ from datetime import datetime
 from pathlib import Path
 from board_reader_lib import (
     read_board, TABLEAU_X, TABLEAU_Y_TOP, COL_WIDTH,
-    FREE_CELL_X, FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
-    HIDDEN_CARD_H, STEP
+    FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
+    HIDDEN_CARD_H, STEP, STOCK_TOTAL, STOCK_TAP_X, STOCK_TAP_Y
 )
-from freecell_solver import State, solve, rank_val
+from freecell_solver import State, solve, rank_val, UNKNOWN
 
 from monte_carlo_solver import (
     choose_move_monte_carlo,
@@ -56,13 +56,13 @@ def assign_pseudo_suits(board):
             red_counts[rank] = count
             card["suit"] = "H" if count == 1 else "D"
 
-    # Scan order: Foundation, Free Cells, then Tableau Columns (exposed cards first)
+    # Scan order: Foundation, Waste, then Tableau Columns (exposed cards first)
     for card in board.get("foundation", []):
         process_card(card)
-        
-    for card in board.get("free_cells", []):
+
+    for card in board.get("waste", []):
         process_card(card)
-        
+
     for col_idx in range(7):
         col_key = f"col{col_idx}"
         for card in board.get(col_key, []):
@@ -71,6 +71,23 @@ def assign_pseudo_suits(board):
 # ==============================================================================
 # 2. COORDINATE RESOLUTION
 # ==============================================================================
+def find_foundation_slot(board, suit):
+    """
+    Foundation piles fill whichever of the 4 physical boxes is available -
+    they aren't fixed to a suit ahead of time - so targeting one means
+    finding whichever box already holds this suit, or (for that suit's
+    Ace, its first card) the first empty box. Returns a FOUNDATION_X index,
+    or None if no matching or empty box exists.
+    """
+    for i, c in enumerate(board["foundation"]):
+        if c and c.get("suit") == suit:
+            return i
+    for i, c in enumerate(board["foundation"]):
+        if c is None:
+            return i
+    return None
+
+
 def get_element_coords(board, item_type, index):
     """
     Calculates the exact center coordinate (x, y) for target slots or top cards.
@@ -79,7 +96,7 @@ def get_element_coords(board, item_type, index):
         col_cards = board[f"col{index}"]
         num_cards = len(col_cards)
         x_center = TABLEAU_X[index] + COL_WIDTH / 2
-        
+
         if num_cards == 0:
             # Empty column click target
             y_center = TABLEAU_Y_TOP + SLOT_H / 2
@@ -90,18 +107,27 @@ def get_element_coords(board, item_type, index):
             y_edge = TABLEAU_Y_TOP + hidden_count * HIDDEN_CARD_H + max(0, revealed_count - 1) * STEP
             y_center = y_edge + SLOT_H / 2
         return int(x_center), int(y_center)
-        
-    elif item_type == "free":
-        x_center = FREE_CELL_X[index] + SLOT_W / 2
+
+    elif item_type == "waste":
+        if not board["waste"]:
+            return None
+        top = board["waste"][-1]
+        x_center = top["x"] + SLOT_W / 2
         y_center = SLOT_Y + SLOT_H / 2
         return int(x_center), int(y_center)
-        
+
     elif item_type == "found":
-        # We only have one foundation pile coordinates defined
-        x_center = FOUNDATION_X[0] + SLOT_W / 2
+        # index is the target suit here, not a physical slot number
+        slot_idx = find_foundation_slot(board, index)
+        if slot_idx is None:
+            return None
+        x_center = FOUNDATION_X[slot_idx] + SLOT_W / 2
         y_center = SLOT_Y + SLOT_H / 2
         return int(x_center), int(y_center)
-        
+
+    elif item_type == "stock":
+        return STOCK_TAP_X, STOCK_TAP_Y
+
     return None
 
 
@@ -116,44 +142,37 @@ def apply_move_to_board(board, move):
     tuples. This keeps `board` in sync with the physical game after we
     execute a move without paying for a fresh screenshot + CV read, so a
     whole batch of moves can be run per screen-read cycle instead of one.
+
+    "draw" and "redeal" reveal/rearrange real physical cards this local
+    model has no way to know ahead of a fresh screen read - the main loop
+    breaks the batch immediately after executing either (see main()), so
+    this function is never asked to simulate their effect.
     """
     kind = move[0]
 
-    def find_free(rank, suit):
-        for idx, c in enumerate(board["free_cells"]):
-            if c and c.get("rank") == rank and c.get("suit") == suit:
-                return idx
-        return None
-
-    def first_empty_free():
-        for idx, c in enumerate(board["free_cells"]):
-            if c is None:
-                return idx
-        return None
+    def record_foundation(card):
+        rank, suit = card
+        slot_idx = find_foundation_slot(board, suit)
+        if slot_idx is not None:
+            board["foundation"][slot_idx] = {
+                "rank": rank, "suit": suit, "color": card_color(suit), "score": 1.0,
+            }
 
     if kind == "col_to_found":
         _, ci, card = move
         board[f"col{ci}"].pop()
-    elif kind == "free_to_found":
+        record_foundation(card)
+    elif kind == "waste_to_found":
         _, card = move
-        fi = find_free(card[0], card[1])
-        if fi is not None:
-            board["free_cells"][fi] = None
+        board["waste"].pop()
+        record_foundation(card)
     elif kind == "col_to_col":
         _, ci, cj, card = move
         board[f"col{ci}"].pop()
         board[f"col{cj}"].append({"rank": card[0], "suit": card[1], "color": card_color(card[1]), "score": 1.0})
-    elif kind == "col_to_free":
-        _, ci, card = move
-        board[f"col{ci}"].pop()
-        fi = first_empty_free()
-        if fi is not None:
-            board["free_cells"][fi] = {"rank": card[0], "suit": card[1], "color": card_color(card[1]), "score": 1.0}
-    elif kind == "free_to_col":
+    elif kind == "waste_to_col":
         _, cj, card = move
-        fi = find_free(card[0], card[1])
-        if fi is not None:
-            board["free_cells"][fi] = None
+        board["waste"].pop()
         board[f"col{cj}"].append({"rank": card[0], "suit": card[1], "color": card_color(card[1]), "score": 1.0})
 
 
@@ -165,7 +184,7 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
     Translates a solver move into coordinates and triggers the swipe/tap.
     """
     kind = move[0]
-    card = move[-1]
+    card = move[-1] if kind not in ("draw", "redeal") else None
     emit = event_logger or (lambda event_name, **data: None)
     start_coords = None
     end_coords = None
@@ -173,60 +192,54 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
     if kind == "col_to_found":
         _, ci, card = move
         start_coords = get_element_coords(board, "col", ci)
-        end_coords = get_element_coords(board, "found", 0)
-        
-    elif kind == "free_to_found":
+        end_coords = get_element_coords(board, "found", card[1])
+
+    elif kind == "waste_to_found":
         _, card = move
-        # Locate the free cell index carrying this card
-        fi = None
-        for idx, c in enumerate(board["free_cells"]):
-            if c and c.get("rank") == card[0] and c.get("suit") == card[1]:
-                fi = idx
-                break
-        if fi is not None:
-            start_coords = get_element_coords(board, "free", fi)
-            end_coords = get_element_coords(board, "found", 0)
-            
+        start_coords = get_element_coords(board, "waste", None)
+        end_coords = get_element_coords(board, "found", card[1])
+
     elif kind == "col_to_col":
         _, ci, cj, card = move
         start_coords = get_element_coords(board, "col", ci)
         end_coords = get_element_coords(board, "col", cj)
-        
-    elif kind == "col_to_free":
-        _, ci, card = move
-        # Locate first empty free cell
-        fi = None
-        for idx, c in enumerate(board["free_cells"]):
-            if c is None:
-                fi = idx
-                break
-        if fi is not None:
-            start_coords = get_element_coords(board, "col", ci)
-            end_coords = get_element_coords(board, "free", fi)
-            
-    elif kind == "free_to_col":
-        _, cj, card = move
-        fi = None
-        for idx, c in enumerate(board["free_cells"]):
-            if c and c.get("rank") == card[0] and c.get("suit") == card[1]:
-                fi = idx
-                break
-        if fi is not None:
-            start_coords = get_element_coords(board, "free", fi)
-            end_coords = get_element_coords(board, "col", cj)
 
-    # Sanity-check: for moves that pop the top of a tableau column, make sure
-    # the physical top card actually matches what the solver believes is
-    # there. Board state and solver state can diverge (e.g. a revealed card
-    # whose suit couldn't be read gets dropped from the solver's view), and
-    # blindly swiping in that case would drag the wrong real card.
-    if kind in ("col_to_found", "col_to_col", "col_to_free"):
+    elif kind == "waste_to_col":
+        _, cj, card = move
+        start_coords = get_element_coords(board, "waste", None)
+        end_coords = get_element_coords(board, "col", cj)
+
+    elif kind in ("draw", "redeal"):
+        # Same physical button either way - the game itself decides
+        # whether the tap draws the next 3 cards or triggers the redeal.
+        start_coords = end_coords = get_element_coords(board, "stock", None)
+
+    # Sanity-check: for moves that pop the top of a tableau column or the
+    # top of waste, make sure the physical top card actually matches what
+    # the solver believes is there. Board state and solver state can
+    # diverge (e.g. a revealed card whose suit couldn't be read gets
+    # dropped from the solver's view), and blindly swiping in that case
+    # would drag the wrong real card.
+    if kind in ("col_to_found", "col_to_col"):
         ci = move[1]
         physical_col = board[f"col{ci}"]
         top = physical_col[-1] if physical_col else None
-        card = move[-1]
         if not top or top.get("rank") != card[0] or top.get("suit") != card[1]:
             print(f"[Warn] Skipping move {move}: physical top of col{ci} "
+                  f"({top}) does not match solver's expected card {card}. "
+                  f"Board read is stale or ambiguous; will re-read next cycle.")
+            emit(
+                "move_rejected",
+                move=move,
+                reason="physical_top_mismatch",
+                physical_top=top,
+                expected_card=card,
+            )
+            return False
+    elif kind in ("waste_to_found", "waste_to_col"):
+        top = board["waste"][-1] if board["waste"] else None
+        if not top or top.get("rank") != card[0] or top.get("suit") != card[1]:
+            print(f"[Warn] Skipping move {move}: physical top of waste "
                   f"({top}) does not match solver's expected card {card}. "
                   f"Board read is stale or ambiguous; will re-read next cycle.")
             emit(
@@ -241,8 +254,9 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
     if start_coords and end_coords:
         x1, y1 = start_coords
         x2, y2 = end_coords
-        if kind in ("col_to_found", "free_to_found"):
-            print(f"[*] Action: Tap to Foundation: {card} at ({x1}, {y1})")
+        if kind in ("col_to_found", "waste_to_found", "draw", "redeal"):
+            label = card if card is not None else kind
+            print(f"[*] Action: Tap ({kind}): {label} at ({x1}, {y1})")
             emit(
                 "gesture_planned",
                 move=move,
@@ -287,7 +301,7 @@ def count_unresolved_cards(board):
         for card in board.get(f"col{idx}", []):
             if card and (card.get("rank") == "?" or card.get("color") == "?"):
                 unresolved += 1
-    for area in ("free_cells", "foundation"):
+    for area in ("waste", "foundation"):
         for card in board.get(area, []):
             if card and (card.get("rank") == "?" or card.get("color") == "?"):
                 unresolved += 1
@@ -490,9 +504,9 @@ def main():
                 col_info = [f"{c['rank']}({c['color']})" for c in board[col_key]]
                 print(f"  col{idx}: {col_info}")
 
-            free_info = [f"{c['rank']}({c['color']})" if c else "None" for c in board["free_cells"]]
+            waste_info = [f"{c['rank']}({c['color']})" for c in board["waste"]]
             found_info = [f"{c['rank']}({c['color']})" if c else "None" for c in board["foundation"]]
-            print(f"  free_cells: {free_info}")
+            print(f"  waste: {waste_info}")
             print(f"  foundation: {found_info}")
 
             assign_pseudo_suits(board)
@@ -503,6 +517,13 @@ def main():
                 col = []
                 for card in board[f"col{idx}"]:
                     if card and card.get("rank") == "?" and card.get("color") == "?":
+                        # face-down card - identity unknown until the game
+                        # reveals it, but it still occupies a real slot in
+                        # this column (it's not empty just because nothing
+                        # revealed is left in it), so it can't just be
+                        # dropped from the column like the old FreeCell
+                        # model did (FreeCell has no hidden cards at all).
+                        col.append(UNKNOWN)
                         continue
                     if card and "suit" in card:
                         col.append((card["rank"], card["suit"]))
@@ -512,33 +533,45 @@ def main():
                         break
                 cols.append(col)
 
-            free = []
-            for card in board["free_cells"]:
+            waste = []
+            for card in board["waste"]:
                 if card and "suit" in card:
-                    free.append((card["rank"], card["suit"]))
+                    waste.append((card["rank"], card["suit"]))
 
             found = {}
             for card in board["foundation"]:
                 if card and "suit" in card:
                     found[card["suit"]] = rank_val(card["rank"])
 
+            # Every real card is accounted for in exactly one of: dealt into
+            # a column (revealed or still face-down, both counted above),
+            # sitting in the waste, on a foundation, or still undrawn in
+            # stock - so whatever's left over after the first three must be
+            # in stock. This is self-correcting every cycle from a fresh
+            # board read rather than a tap-counter that could drift if a
+            # tap is missed or mistimed.
+            stock_remaining = 52 - sum(len(c) for c in cols) - len(waste) \
+                - sum(v + 1 for v in found.values())
+
             print("[*] Formulated Solver State:")
             print(f"  Cols: {cols}")
-            print(f"  Free: {free}")
+            print(f"  Waste: {waste}")
             print(f"  Found: {found}")
+            print(f"  Stock remaining: {stock_remaining}")
             log_event(
                 "solver_state_built",
                 cycle=cycle_number,
                 columns=cols,
-                free=free,
+                waste=waste,
                 foundations=found,
+                stock_remaining=stock_remaining,
                 truncated_columns=truncated_columns,
             )
 
             if args.solver == "monte-carlo":
                 print("[*] Running Monte Carlo move search...")
                 solver_started = time.perf_counter()
-                state = State(cols, free, found)
+                state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
                 move, statistics = choose_move_monte_carlo(state)
                 solver_seconds = time.perf_counter() - solver_started
                 print_statistics(statistics)
@@ -584,7 +617,9 @@ def main():
                 solver_started = time.perf_counter()
                 path, explored, solved, status = solve(
                     cols,
-                    initial_free=free,
+                    initial_waste=waste,
+                    initial_stock_remaining=stock_remaining,
+                    initial_stock_total=STOCK_TOTAL,
                     initial_found=found,
                     time_limit=5.0,
                 )
@@ -621,6 +656,14 @@ def main():
                         )
                         if not ok:
                             print("[*] Stopping batch early; will re-read the board next cycle.")
+                            break
+                        if move[0] in ("draw", "redeal"):
+                            # Reveals/rearranges real physical cards this
+                            # local model can't simulate (see
+                            # apply_move_to_board's docstring) - stop the
+                            # batch here so the next cycle re-reads the
+                            # screen instead of planning on stale info.
+                            print("[*] Stopping batch after draw/redeal; will re-read the board next cycle.")
                             break
                         apply_move_to_board(board, move)
                 else:

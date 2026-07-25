@@ -18,7 +18,7 @@ def main():
         [],
     ]
 
-    free_cells = [
+    waste = [
         ("A", "S"),
     ]
 
@@ -26,7 +26,9 @@ def main():
 
     state = State(
         cols=columns,
-        free=free_cells,
+        waste=waste,
+        stock_remaining=0,
+        stock_total=0,
         found=foundations,
     )
 

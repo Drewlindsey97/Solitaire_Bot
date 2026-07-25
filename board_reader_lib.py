@@ -20,20 +20,35 @@ TABLEAU_X = [10, 111, 212, 313, 414, 512, 611]
 TABLEAU_Y_TOP = 507
 COL_WIDTH = 95
 
-FREE_CELL_X = [10, 110, 210, 310]
-FOUNDATION_X = [472]
+# Confirmed live against the real device: the 4 boxes at this position are
+# the foundation piles (dragging an out-of-sequence card there is rejected,
+# and an exposed Ace has been observed auto-completing into one of these
+# boxes) - not free cells. The game has no free cells at all.
+FOUNDATION_X = [10, 110, 210, 310]
 SLOT_Y = 303
 SLOT_W, SLOT_H = 95, 90
 
-# Foundation piles render fanned/overlapping in this UI - only the frontmost
-# pile shows a full card, piles behind it show just a sliver of their own
-# corner rank digit - so a single fixed x either misses piles or bleeds
-# across several (a single x=472 crop was observed pulling in two different
-# piles' digits at once). FOUNDATION_SCAN_X0 starts just past free cell 4's
-# right edge (310 + SLOT_W = 405) so free-cell content already handled by
-# read_slot() below can't bleed in and get mistaken for a foundation pile.
-FOUNDATION_SCAN_X0, FOUNDATION_SCAN_X1 = 410, 650
-FOUNDATION_PEAK_THRESHOLD = 0.65
+# The waste pile (draw-3 stock reveal) renders fanned/overlapping in this
+# UI - only the frontmost card shows in full, cards behind it show just a
+# sliver of their own corner rank digit - so a single fixed x either misses
+# cards or bleeds across several (a single x=472 crop was observed pulling
+# in two different cards' digits at once). WASTE_SCAN_X0 starts just past
+# foundation slot 4's right edge (310 + SLOT_W = 405) so foundation content
+# already handled by read_slot() below can't bleed in and get mistaken for
+# a waste card.
+WASTE_SCAN_X0, WASTE_SCAN_X1 = 410, 650
+WASTE_PEAK_THRESHOLD = 0.65
+
+# Confirmed live by tapping through an entire stock cycle: 24 cards, drawn
+# 3 at a time (8 taps to exhaust), then an unlimited, deterministic redeal
+# (the same 24 cards return in the same order every cycle). The deal shape
+# is always the classic 1-7 tableau triangle (28 cards), so stock is always
+# the fixed remainder: 52 - 28 = 24.
+STOCK_TOTAL = 24
+# Confirmed live: tapping this position both draws the next 3 cards and,
+# once the stock is exhausted, triggers the redeal - same physical button,
+# the game itself decides which behavior applies.
+STOCK_TAP_X, STOCK_TAP_Y = 662, 368
 
 def load_templates(folder):
     t = {}
@@ -98,20 +113,21 @@ def match_suit(patch, color, template_set=SUIT_TEMPLATES):
     name, score = match_rank(patch, narrowed)
     return name.split("_")[0], score
 
-def detect_foundation_slots(img):
-    """Dynamically locate each visible foundation pile's corner rank digit,
-    instead of reading a single fixed x-coordinate. Piles behind the
+def detect_waste_slots(img):
+    """Dynamically locate each visible waste-pile card's corner rank digit,
+    instead of reading a single fixed x-coordinate. Cards behind the
     frontmost one only reveal a sliver of their own corner index, so
     contour/bbox segmentation can't separate them (overlapping cards fuse
-    into one blob) - this scans the whole foundation band with the existing
+    into one blob) - this scans the whole waste band with the existing
     rank templates via sliding-window template matching (cv2.matchTemplate
     naturally scores every x-shift in one call) and returns one (x, rank,
-    score) per local peak above threshold. Unpopulated piles simply produce
-    no peak, so this adapts to however many piles currently have cards
+    score) per local peak above threshold. An empty waste (nothing drawn
+    yet, or just after a redeal) simply produces no peak, so this adapts
+    to however many of the up-to-3 drawn cards are currently showing
     without needing to know that count in advance.
     """
     def scan(template_set, h):
-        strip = img[SLOT_Y:SLOT_Y+h, FOUNDATION_SCAN_X0:FOUNDATION_SCAN_X1]
+        strip = img[SLOT_Y:SLOT_Y+h, WASTE_SCAN_X0:WASTE_SCAN_X1]
         gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         padded = cv2.copyMakeBorder(binary, PAD, PAD, PAD, PAD, cv2.BORDER_CONSTANT, value=0)
@@ -141,12 +157,12 @@ def detect_foundation_slots(img):
     slots = []
     i = 0
     while i < length:
-        if score[i] > FOUNDATION_PEAK_THRESHOLD:
+        if score[i] > WASTE_PEAK_THRESHOLD:
             j = i
-            while j < length and score[j] > FOUNDATION_PEAK_THRESHOLD:
+            while j < length and score[j] > WASTE_PEAK_THRESHOLD:
                 j += 1
             peak = i + int(np.argmax(score[i:j]))
-            x = FOUNDATION_SCAN_X0 + peak - PAD
+            x = WASTE_SCAN_X0 + peak - PAD
             slots.append((x, str(name[peak]), round(float(score[peak]), 2)))
             i = j
         else:
@@ -263,15 +279,20 @@ def read_board(frame_path):
         score = min(score, suit_score)
         return {"rank": name, "suit": suit, "color": color, "score": round(float(score), 2)}
 
-    board["free_cells"] = [read_slot(x) for x in FREE_CELL_X]
+    # Foundation piles are 4 separate, non-overlapping boxes (unlike the
+    # fanned waste pile below), so the same per-x read_slot() used for
+    # tableau "last card" reads applies directly - one clean crop per box.
+    board["foundation"] = [read_slot(x) for x in FOUNDATION_X]
 
-    foundation = []
-    for x, rank, rank_score in detect_foundation_slots(img):
+    waste = []
+    for x, rank, rank_score in detect_waste_slots(img):
         suit_patch = img[SLOT_Y+SUIT_Y_OFF:SLOT_Y+SUIT_Y_OFF+SUIT_H, x+SUIT_X_OFF:x+SUIT_X_OFF+SUIT_W]
         color = classify_suit_color(suit_patch)
         suit, suit_score = match_suit(suit_patch, color)
         score = min(rank_score, suit_score)
-        foundation.append({"rank": rank, "suit": suit, "color": color, "score": round(float(score), 2)})
-    board["foundation"] = foundation
+        # keep the source x so callers can find the current playable
+        # (frontmost = last = highest x) card's tap/swipe position
+        waste.append({"rank": rank, "suit": suit, "color": color, "score": round(float(score), 2), "x": x})
+    board["waste"] = waste
 
     return board
