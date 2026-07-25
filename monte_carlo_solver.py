@@ -45,12 +45,18 @@ def total_card_count(state: State) -> int:
     Foundation values are stored as zero-based rank values:
     Ace = 0, Two = 1, ..., King = 12.
     Therefore, a foundation value of 3 represents four cards.
+
+    tableau_cards already includes any UNKNOWN placeholders for a
+    column's still-hidden (face-down) cards, and stock_remaining counts
+    cards not yet drawn - both are real cards not yet on a foundation,
+    so both must be counted for `is_solved` to only fire once the whole
+    deck (not just what's currently revealed) is on foundation.
     """
     tableau_cards = sum(len(column) for column in state.cols)
-    free_cards = len(state.free)
+    waste_cards = len(state.waste)
     foundation_cards = sum(value + 1 for _, value in state.found)
 
-    return tableau_cards + free_cards + foundation_cards
+    return tableau_cards + waste_cards + state.stock_remaining + foundation_cards
 
 
 def foundation_card_count(state: State) -> int:
@@ -63,10 +69,6 @@ def is_solved(state: State, expected_total: int) -> bool:
 
 def count_empty_columns(state: State) -> int:
     return sum(1 for column in state.cols if not column)
-
-
-def count_open_free_cells(state: State) -> int:
-    return 4 - len(state.free)
 
 
 def mobility(state: State) -> int:
@@ -82,8 +84,8 @@ def evaluate_state(state: State, expected_total: int) -> float:
     """
     Score an unfinished rollout.
 
-    Foundation progress matters most. Open free cells, empty columns,
-    and available moves are smaller bonuses.
+    Foundation progress matters most. Empty columns and available moves
+    are smaller bonuses.
     """
     foundation_cards = foundation_card_count(state)
 
@@ -94,11 +96,7 @@ def evaluate_state(state: State, expected_total: int) -> float:
 
     score += foundation_cards * 1_000.0
     score += count_empty_columns(state) * 40.0
-    score += count_open_free_cells(state) * 20.0
     score += mobility(state) * 2.0
-
-    # Keeping cards trapped in free cells reduces flexibility.
-    score -= len(state.free) * 8.0
 
     return score
 
@@ -114,16 +112,19 @@ def move_priority(state: State, move: tuple) -> float:
 
     priority = 1.0
 
-    if kind in ("col_to_found", "free_to_found"):
+    if kind in ("col_to_found", "waste_to_found"):
         priority += 12.0
 
-    elif kind == "free_to_col":
+    elif kind == "waste_to_col":
         priority += 5.0
 
     elif kind == "col_to_col":
         priority += 3.0
 
-    elif kind == "col_to_free":
+    elif kind in ("draw", "redeal"):
+        # Lowest priority, matching their status as fallback-only moves in
+        # generate_moves() - a hypothetical draw/redeal never reveals
+        # anything the rollout can act on (see UNKNOWN in freecell_solver).
         priority += 0.5
 
     try:
@@ -131,9 +132,6 @@ def move_priority(state: State, move: tuple) -> float:
 
         if count_empty_columns(next_state) > count_empty_columns(state):
             priority += 4.0
-
-        if count_open_free_cells(next_state) > count_open_free_cells(state):
-            priority += 3.0
 
     except (IndexError, KeyError, ValueError):
         return 0.0
@@ -178,14 +176,13 @@ def rollout(
             Number of simulated moves performed.
     """
     state = starting_state
-    previous_move: Optional[tuple] = None
     visited = {state.key()}
 
     for depth in range(max_depth):
         if is_solved(state, expected_total):
             return WIN_SCORE, True, depth
 
-        moves = generate_moves(state, previous_move)
+        moves = generate_moves(state)
 
         if not moves:
             return evaluate_state(state, expected_total), False, depth
@@ -220,7 +217,6 @@ def rollout(
             if move == selected_move
         )
 
-        previous_move = selected_move
         state = next_state
         visited.add(state.key())
 
