@@ -568,6 +568,8 @@ def main():
                 truncated_columns=truncated_columns,
             )
 
+            solved = False  # monte-carlo doesn't track full-game-solved status; only "search" sets this
+
             if args.solver == "monte-carlo":
                 print("[*] Running Monte Carlo move search...")
                 solver_started = time.perf_counter()
@@ -667,13 +669,17 @@ def main():
                             break
                         apply_move_to_board(board, move)
                 else:
-                    print("[*] No moves found. Board might already be solved or no path exists.")
-                    log_event("no_move_selected", cycle=cycle_number, solver="search")
+                    if solved:
+                        print("[*] GAME SOLVED! All cards are on foundation.")
+                        log_event("game_solved", cycle=cycle_number)
+                    else:
+                        print("[*] No moves found. Board might already be solved or no path exists.")
+                        log_event("no_move_selected", cycle=cycle_number, solver="search")
 
             cycle_seconds = time.perf_counter() - cycle_started
             log_event("cycle_finished", cycle=cycle_number, duration_seconds=cycle_seconds)
 
-            if sim_mode:
+            if sim_mode or solved:
                 break
 
             print(f"[*] Waiting for UI update ({args.interval}s)...")
