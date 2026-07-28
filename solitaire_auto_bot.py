@@ -641,6 +641,7 @@ def main():
                 if path:
                     batch = path if args.moves_per_cycle <= 0 else path[:args.moves_per_cycle]
                     print(f"[*] Executing {len(batch)} move(s) this cycle:")
+                    batch_completed = True
                     for idx, move in enumerate(batch):
                         print(f"  {idx + 1}. {move}")
                         ok = execute_move(
@@ -658,6 +659,7 @@ def main():
                         )
                         if not ok:
                             print("[*] Stopping batch early; will re-read the board next cycle.")
+                            batch_completed = False
                             break
                         if move[0] in ("draw", "redeal"):
                             # Reveals/rearranges real physical cards this
@@ -666,8 +668,18 @@ def main():
                             # batch here so the next cycle re-reads the
                             # screen instead of planning on stale info.
                             print("[*] Stopping batch after draw/redeal; will re-read the board next cycle.")
+                            batch_completed = False
                             break
                         apply_move_to_board(board, move)
+
+                    # solve()'s `solved` flag only certifies a winning path exists
+                    # from the analyzed position, not that this cycle executed all
+                    # of it - only treat the game as finished once the full path
+                    # has actually landed on the board.
+                    solved = solved and batch_completed and len(batch) == len(path)
+                    if solved:
+                        print("[*] GAME SOLVED! All cards are on foundation.")
+                        log_event("game_solved", cycle=cycle_number)
                 else:
                     if solved:
                         print("[*] GAME SOLVED! All cards are on foundation.")
