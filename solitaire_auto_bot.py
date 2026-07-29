@@ -426,6 +426,17 @@ def main():
     previous_solver_signature = None
     previous_first_move = None
     excluded_first_moves = set()
+    # A move that fails once might just be a one-off flaky gesture, worth
+    # retrying later - but a move that keeps failing repeatedly across the
+    # whole session (some specific source/destination pairing the device
+    # consistently rejects) will otherwise get proposed again every time
+    # some unrelated move elsewhere succeeds and clears the one-retry
+    # exclusion above, wasting most of the run stuck on it. Once a move's
+    # total failure count crosses this, stop offering it for the rest of
+    # the session instead of only for the immediate next retry.
+    MOVE_PERMANENT_EXCLUDE_THRESHOLD = 3
+    move_failure_counts = {}
+    permanently_excluded_moves = set()
     # Real board states from the last several cycles - not just the
     # immediately previous one. Two occupied columns can score identically
     # under the heuristic (e.g. a red Queen sitting on either of two black
@@ -609,6 +620,19 @@ def main():
                       f"excluding it and re-solving.")
                 log_event("move_stuck_excluding", cycle=cycle_number, move=previous_first_move)
                 excluded_first_moves.add(previous_first_move)
+
+                fail_count = move_failure_counts.get(previous_first_move, 0) + 1
+                move_failure_counts[previous_first_move] = fail_count
+                if fail_count >= MOVE_PERMANENT_EXCLUDE_THRESHOLD:
+                    print(f"[Warn] {previous_first_move} has now failed {fail_count} times "
+                          f"this session; excluding it permanently.")
+                    log_event(
+                        "move_permanently_excluding",
+                        cycle=cycle_number,
+                        move=previous_first_move,
+                        fail_count=fail_count,
+                    )
+                    permanently_excluded_moves.add(previous_first_move)
             else:
                 excluded_first_moves = set()
             previous_solver_signature = current_solver_signature
@@ -673,7 +697,7 @@ def main():
                         initial_stock_total=STOCK_TOTAL,
                         initial_found=found,
                         time_limit=5.0,
-                        excluded_first_moves=excluded_first_moves | cycle_guard_excluded,
+                        excluded_first_moves=excluded_first_moves | cycle_guard_excluded | permanently_excluded_moves,
                     )
                     if not path:
                         break
