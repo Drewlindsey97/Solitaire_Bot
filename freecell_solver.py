@@ -200,10 +200,13 @@ def generate_moves(state, exclude=None):
     # early, since either way it only ever sees UNKNOWN until a real
     # perceive-cycle reveals the true cards.
     if not moves:
+        fallback = None
         if state.stock_remaining > 0:
-            moves.append(("draw",))
+            fallback = ("draw",)
         elif state.stock_total > 0:
-            moves.append(("redeal",))
+            fallback = ("redeal",)
+        if fallback is not None and (not exclude or fallback not in exclude):
+            moves.append(fallback)
 
     return moves
 
