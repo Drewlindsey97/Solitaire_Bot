@@ -155,21 +155,30 @@ def generate_moves(state, exclude=None):
 
         for run_length in range(1, max_run + 1):
             card = col[-run_length]
-            # A run that's already alone at the bottom of its column
+            # Confirmed live: this game only allows a King onto an empty
+            # column (unlike standard Klondike, where any card can go
+            # there) - offering a non-King move to an empty column looks
+            # legal to the search but the real game silently rejects it,
+            # which used to show up as an endless supply of distinct
+            # run-length candidates (each one a "new" move to try) that
+            # all failed to execute instead of the search ever concluding
+            # there was nothing useful left and falling back to a draw.
+            is_king = card[0] == "K"
+            # A King run that's already alone at the bottom of its column
             # (nothing left to reveal underneath) gains nothing from
             # moving to another empty column: the source becomes empty
             # and the destination stops being empty, so the total count
             # of empty columns - all the heuristic tracks - is unchanged.
-            # Offering this move lets the search shuffle a lone run
-            # (usually a King, or a King-headed run) back and forth
-            # between empty columns for free instead of making progress.
+            # Offering this move lets the search shuffle a lone King run
+            # back and forth between empty columns for free instead of
+            # making progress.
             lone_in_column = run_length == len(col)
             placed_on_empty = False
             for cj, col2 in enumerate(cols):
                 if ci == cj:
                     continue
                 if not col2:
-                    if lone_in_column:
+                    if not is_king or lone_in_column:
                         continue
                     if not placed_on_empty:
                         moves.append(("col_to_col", ci, cj, card, run_length))
@@ -181,7 +190,7 @@ def generate_moves(state, exclude=None):
         placed_on_empty = False
         for cj, col2 in enumerate(cols):
             if not col2:
-                if not placed_on_empty:
+                if waste_top[0] == "K" and not placed_on_empty:
                     moves.append(("waste_to_col", cj, waste_top))
                     placed_on_empty = True
             elif can_stack(waste_top, col2[-1]):
