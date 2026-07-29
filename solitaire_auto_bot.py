@@ -3,6 +3,7 @@ import time
 import sys
 import os
 import argparse
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from board_reader_lib import (
@@ -10,7 +11,7 @@ from board_reader_lib import (
     FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
     HIDDEN_CARD_H, STEP, STOCK_TOTAL, STOCK_TAP_X, STOCK_TAP_Y
 )
-from freecell_solver import State, solve, rank_val, UNKNOWN
+from freecell_solver import State, solve, apply_move, rank_val, UNKNOWN
 
 from monte_carlo_solver import (
     choose_move_monte_carlo,
@@ -425,6 +426,15 @@ def main():
     previous_solver_signature = None
     previous_first_move = None
     excluded_first_moves = set()
+    # Real board states from the last several cycles - not just the
+    # immediately previous one. Two occupied columns can score identically
+    # under the heuristic (e.g. a red Queen sitting on either of two black
+    # Kings), so the search can end up "preferring" to shuffle a card
+    # back and forth between them across cycles: each individual move
+    # genuinely succeeds (so the single-previous-cycle stuck-move check
+    # above never fires), but it just walks the board back to a state
+    # already visited a few cycles ago instead of making progress.
+    recent_board_signatures = deque(maxlen=10)
 
     try:
         if logcat_monitor is not None:
@@ -603,6 +613,7 @@ def main():
                 excluded_first_moves = set()
             previous_solver_signature = current_solver_signature
             previous_first_move = None
+            recent_board_signatures.append(current_solver_signature)
 
             solved = False  # monte-carlo doesn't track full-game-solved status; only "search" sets this
 
@@ -653,15 +664,43 @@ def main():
             else:
                 print("[*] Searching for a path...")
                 solver_started = time.perf_counter()
-                path, explored, solved, status = solve(
-                    cols,
-                    initial_waste=waste,
-                    initial_stock_remaining=stock_remaining,
-                    initial_stock_total=STOCK_TOTAL,
-                    initial_found=found,
-                    time_limit=5.0,
-                    excluded_first_moves=excluded_first_moves,
-                )
+                cycle_guard_excluded = set()
+                for _attempt in range(4):
+                    path, explored, solved, status = solve(
+                        cols,
+                        initial_waste=waste,
+                        initial_stock_remaining=stock_remaining,
+                        initial_stock_total=STOCK_TOTAL,
+                        initial_found=found,
+                        time_limit=5.0,
+                        excluded_first_moves=excluded_first_moves | cycle_guard_excluded,
+                    )
+                    if not path:
+                        break
+                    # Would committing this move just walk the board back into
+                    # a state we've already visited in the last several
+                    # cycles? Two occupied columns can score identically
+                    # under the heuristic (e.g. a red Queen sitting on either
+                    # of two black Kings), so the search can end up
+                    # "preferring" to shuffle a card between them forever -
+                    # each individual move genuinely succeeds (the
+                    # single-previous-cycle stuck-move check above never
+                    # fires), it just never goes anywhere.
+                    start_state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
+                    next_state = apply_move(start_state, path[0])
+                    next_signature = (
+                        next_state.cols, next_state.waste,
+                        next_state.found, next_state.stock_remaining,
+                    )
+                    if next_signature not in recent_board_signatures:
+                        break
+                    print(f"[Warn] {path[0]} would revisit a recently seen board "
+                          f"state; excluding it and re-solving.")
+                    log_event("move_cycle_excluding", cycle=cycle_number, move=path[0])
+                    cycle_guard_excluded.add(path[0])
+                else:
+                    print("[Warn] Could not find a non-cycling move after several "
+                          "attempts; proceeding with the best one found anyway.")
                 solver_seconds = time.perf_counter() - solver_started
                 log_event(
                     "solver_finished",
