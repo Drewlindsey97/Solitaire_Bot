@@ -133,32 +133,49 @@ def generate_moves(state, exclude=None):
     for ci, col in enumerate(cols):
         if not col:
             continue
-        card = col[-1]
         # A face-down card at the top of a column isn't movable - only the
         # game itself can reveal it (see UNKNOWN's module docstring) - so
         # there's nothing this column can contribute this turn.
-        if card == UNKNOWN:
+        if col[-1] == UNKNOWN:
             continue
-        # A card that's already alone at the bottom of its column (nothing
-        # left to reveal underneath) gains nothing from moving to another
-        # empty column: the source becomes empty and the destination stops
-        # being empty, so the total count of empty columns - all the
-        # heuristic tracks - is unchanged. Offering this move lets the
-        # search shuffle a lone card (usually a King) back and forth
-        # between empty columns for free instead of making real progress.
-        lone_in_column = len(col) == 1
-        placed_on_empty = False
-        for cj, col2 in enumerate(cols):
-            if ci == cj:
-                continue
-            if not col2:
-                if lone_in_column:
+
+        # The bottom of a column may already hold a properly ordered,
+        # fully-revealed run (each card one rank below and the opposite
+        # color of the one above it). Real Klondike UIs let you drag such
+        # a run as a single gesture, and some winning lines are only
+        # reachable that way when there's no empty column free to stage
+        # the cards through one at a time - so every valid run length,
+        # not just the single bottom card, needs to be offered as its
+        # own candidate move (a shorter run can fit a destination the
+        # full run doesn't, and vice versa).
+        max_run = 1
+        while (max_run < len(col) and col[-max_run - 1] != UNKNOWN
+               and can_stack(col[-max_run], col[-max_run - 1])):
+            max_run += 1
+
+        for run_length in range(1, max_run + 1):
+            card = col[-run_length]
+            # A run that's already alone at the bottom of its column
+            # (nothing left to reveal underneath) gains nothing from
+            # moving to another empty column: the source becomes empty
+            # and the destination stops being empty, so the total count
+            # of empty columns - all the heuristic tracks - is unchanged.
+            # Offering this move lets the search shuffle a lone run
+            # (usually a King, or a King-headed run) back and forth
+            # between empty columns for free instead of making progress.
+            lone_in_column = run_length == len(col)
+            placed_on_empty = False
+            for cj, col2 in enumerate(cols):
+                if ci == cj:
                     continue
-                if not placed_on_empty:
-                    moves.append(("col_to_col", ci, cj, card))
-                    placed_on_empty = True
-            elif can_stack(card, col2[-1]):
-                moves.append(("col_to_col", ci, cj, card))
+                if not col2:
+                    if lone_in_column:
+                        continue
+                    if not placed_on_empty:
+                        moves.append(("col_to_col", ci, cj, card, run_length))
+                        placed_on_empty = True
+                elif can_stack(card, col2[-1]):
+                    moves.append(("col_to_col", ci, cj, card, run_length))
 
     if waste_top is not None:
         placed_on_empty = False
@@ -206,9 +223,10 @@ def apply_move(state, move):
         waste.pop()
         found[card[1]] = rank_val(card[0])
     elif kind == "col_to_col":
-        _, ci, cj, card = move
-        cols[ci].pop()
-        cols[cj].append(card)
+        _, ci, cj, card, run_length = move
+        moved = cols[ci][-run_length:]
+        del cols[ci][-run_length:]
+        cols[cj].extend(moved)
     elif kind == "waste_to_col":
         _, cj, card = move
         waste.pop()

@@ -162,7 +162,7 @@ def swipe(x1, y1, x2, y2):
     jx2 = apply_jitter(x2, SWIPE_JITTER_RADIUS) if HUMAN_MODE else x2
     jy2 = apply_jitter(y2, SWIPE_JITTER_RADIUS) if HUMAN_MODE else y2
 
-    duration_ms = random.randint(250, 450) if HUMAN_MODE else 300
+    duration_ms = random.randint(700, 900) if HUMAN_MODE else 800
 
     if RUN_MODE == "HTTP_BRIDGE":
         print(f"Swipe from ({jx1}, {jy1}) to ({jx2}, {jy2}) via HTTP")

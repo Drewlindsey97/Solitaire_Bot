@@ -88,9 +88,15 @@ def find_foundation_slot(board, suit):
     return None
 
 
-def get_element_coords(board, item_type, index):
+def get_element_coords(board, item_type, index, depth_from_bottom=0):
     """
     Calculates the exact center coordinate (x, y) for target slots or top cards.
+
+    depth_from_bottom: for "col", how many cards up from the exposed bottom
+    card to grab - 0 (default) is the bottom/last card, as for a
+    single-card move. A multi-card run drag touches the card at the TOP
+    of the run being moved (further up the column), so its depth is
+    run_length - 1.
     """
     if item_type == "col":
         col_cards = board[f"col{index}"]
@@ -101,10 +107,12 @@ def get_element_coords(board, item_type, index):
             # Empty column click target
             y_center = TABLEAU_Y_TOP + SLOT_H / 2
         else:
-            # Find Y position of the bottom revealed card (exposed card)
+            # Find Y position of the card `depth_from_bottom` cards up from
+            # the bottom-most revealed (exposed) card.
             hidden_count = sum(1 for c in col_cards if c.get("rank") == "?")
             revealed_count = num_cards - hidden_count
-            y_edge = TABLEAU_Y_TOP + hidden_count * HIDDEN_CARD_H + max(0, revealed_count - 1) * STEP
+            y_edge = TABLEAU_Y_TOP + hidden_count * HIDDEN_CARD_H \
+                + max(0, revealed_count - 1 - depth_from_bottom) * STEP
             y_center = y_edge + SLOT_H / 2
         return int(x_center), int(y_center)
 
@@ -167,9 +175,10 @@ def apply_move_to_board(board, move):
         board["waste"].pop()
         record_foundation(card)
     elif kind == "col_to_col":
-        _, ci, cj, card = move
-        board[f"col{ci}"].pop()
-        board[f"col{cj}"].append({"rank": card[0], "suit": card[1], "color": card_color(card[1]), "score": 1.0})
+        _, ci, cj, card, run_length = move
+        moved = board[f"col{ci}"][-run_length:]
+        del board[f"col{ci}"][-run_length:]
+        board[f"col{cj}"].extend(moved)
     elif kind == "waste_to_col":
         _, cj, card = move
         board["waste"].pop()
@@ -184,7 +193,7 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
     Translates a solver move into coordinates and triggers the swipe/tap.
     """
     kind = move[0]
-    card = move[-1] if kind not in ("draw", "redeal") else None
+    card = None
     emit = event_logger or (lambda event_name, **data: None)
     start_coords = None
     end_coords = None
@@ -200,8 +209,8 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
         end_coords = get_element_coords(board, "found", card[1])
 
     elif kind == "col_to_col":
-        _, ci, cj, card = move
-        start_coords = get_element_coords(board, "col", ci)
+        _, ci, cj, card, run_length = move
+        start_coords = get_element_coords(board, "col", ci, depth_from_bottom=run_length - 1)
         end_coords = get_element_coords(board, "col", cj)
 
     elif kind == "waste_to_col":
@@ -222,8 +231,9 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
     # would drag the wrong real card.
     if kind in ("col_to_found", "col_to_col"):
         ci = move[1]
+        run_length = move[4] if kind == "col_to_col" else 1
         physical_col = board[f"col{ci}"]
-        top = physical_col[-1] if physical_col else None
+        top = physical_col[-run_length] if len(physical_col) >= run_length else None
         if not top or top.get("rank") != card[0] or top.get("suit") != card[1]:
             print(f"[Warn] Skipping move {move}: physical top of col{ci} "
                   f"({top}) does not match solver's expected card {card}. "
@@ -269,8 +279,9 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
             else:
                 bridge.tap(x1, y1)
         else:
+            run_note = f" (+{move[4] - 1} card(s) under it)" if kind == "col_to_col" and move[4] > 1 else ""
             print(
-                f"[*] Action: Move {kind.replace('_', ' ')}: {card} "
+                f"[*] Action: Move {kind.replace('_', ' ')}: {card}{run_note} "
                 f"from ({x1}, {y1}) to ({x2}, {y2})"
             )
             emit(
