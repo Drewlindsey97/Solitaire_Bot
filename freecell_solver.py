@@ -99,7 +99,7 @@ def is_safe_autoplay(card, found):
     o1, o2 = ("S", "C") if s in ("H", "D") else ("H", "D")
     return min(found.get(o1, -1), found.get(o2, -1)) >= rv - 1
 
-def generate_moves(state):
+def generate_moves(state, exclude=None):
     moves = []
     cols = state.cols
     waste = state.waste
@@ -109,12 +109,19 @@ def generate_moves(state):
     # A safe auto-play, if one exists, is always correct to make and never
     # worth skipping in favor of some other branch - so prune every other
     # option this turn and force it. See is_safe_autoplay() for why this
-    # is cheaper than collapsing chains into one step ahead of time.
+    # is cheaper than collapsing chains into one step ahead of time. If the
+    # caller has excluded this exact move (e.g. it just failed to actually
+    # register on the real board), don't force it - fall through so it's
+    # reconsidered, and filtered back out, alongside every other option.
     for ci, col in enumerate(cols):
         if col and is_safe_autoplay(col[-1], found):
-            return [("col_to_found", ci, col[-1])]
+            move = ("col_to_found", ci, col[-1])
+            if not exclude or move not in exclude:
+                return [move]
     if waste_top is not None and is_safe_autoplay(waste_top, found):
-        return [("waste_to_found", waste_top)]
+        move = ("waste_to_found", waste_top)
+        if not exclude or move not in exclude:
+            return [move]
 
     for ci, col in enumerate(cols):
         if col and can_found(col[-1], found):
@@ -132,11 +139,21 @@ def generate_moves(state):
         # there's nothing this column can contribute this turn.
         if card == UNKNOWN:
             continue
+        # A card that's already alone at the bottom of its column (nothing
+        # left to reveal underneath) gains nothing from moving to another
+        # empty column: the source becomes empty and the destination stops
+        # being empty, so the total count of empty columns - all the
+        # heuristic tracks - is unchanged. Offering this move lets the
+        # search shuffle a lone card (usually a King) back and forth
+        # between empty columns for free instead of making real progress.
+        lone_in_column = len(col) == 1
         placed_on_empty = False
         for cj, col2 in enumerate(cols):
             if ci == cj:
                 continue
             if not col2:
+                if lone_in_column:
+                    continue
                 if not placed_on_empty:
                     moves.append(("col_to_col", ci, cj, card))
                     placed_on_empty = True
@@ -152,6 +169,9 @@ def generate_moves(state):
                     placed_on_empty = True
             elif can_stack(waste_top, col2[-1]):
                 moves.append(("waste_to_col", cj, waste_top))
+
+    if exclude:
+        moves = [m for m in moves if m not in exclude]
 
     # Drawing/redealing only ever reveals an UNKNOWN placeholder to the
     # search (see module docstring on UNKNOWN) - there's nothing a
@@ -209,7 +229,7 @@ def apply_move(state, move):
 
 def solve(initial_cols, initial_waste=None, initial_stock_remaining=0, initial_stock_total=0,
           initial_found=None, progress_every=100_000, max_seen=3_000_000, weight=5,
-          time_limit=100.0):
+          time_limit=100.0, excluded_first_moves=None):
     """
     Weighted best-first search (f = g + weight*h) that runs until the game
     is won, every reachable state has been explored with no solution found
@@ -238,6 +258,14 @@ def solve(initial_cols, initial_waste=None, initial_stock_remaining=0, initial_s
     return an answer. time_limit guarantees a bounded return even when
     max_seen would not kick in soon enough. Pass None to disable it (falls
     back to max_seen / full exhaustion only).
+
+    excluded_first_moves: an optional set of moves to refuse as the very
+    next action (path == [] at that point), while still allowing them
+    later in a plan. For a move the caller already tried and confirmed
+    didn't actually happen on the real board (e.g. a swipe the physical
+    game didn't register), re-suggesting it as-is just repeats the same
+    no-op forever - excluding it forces the search to report a different
+    real next step (or a genuine draw/redeal) instead.
 
     Returns (path, explored, solved_bool, status). status is one of
     "solved", "exhausted" (proven unsolvable), "capped" (state-count limit
@@ -299,7 +327,8 @@ def solve(initial_cols, initial_waste=None, initial_stock_remaining=0, initial_s
             print(f"  ...memory cap reached ({max_seen} states tracked), stopping")
             return best_path, explored, False, "capped"
 
-        for move in generate_moves(state):
+        moves = generate_moves(state, exclude=excluded_first_moves if not path else None)
+        for move in moves:
             new_state = apply_move(state, move)
             g = len(path) + 1
             hh = heuristic(new_state)

@@ -411,6 +411,9 @@ def main():
     cycle_number = 0
     interrupted = False
     logcat_started = False
+    previous_solver_signature = None
+    previous_first_move = None
+    excluded_first_moves = set()
 
     try:
         if logcat_monitor is not None:
@@ -568,6 +571,28 @@ def main():
                 truncated_columns=truncated_columns,
             )
 
+            # execute_move() only confirms a gesture was dispatched, not that
+            # the physical game actually applied it - a swipe can be issued
+            # cleanly and still not register on the device. Detect that by
+            # comparing this fresh read against the read from before the
+            # previous cycle's moves: if nothing changed despite having
+            # attempted a real move, that move is a no-op on the real board
+            # and re-suggesting it as-is would just repeat forever.
+            current_solver_signature = (
+                tuple(tuple(c) for c in cols), tuple(waste),
+                tuple(sorted(found.items())), stock_remaining,
+            )
+            if (args.solver == "search" and previous_first_move is not None
+                    and current_solver_signature == previous_solver_signature):
+                print(f"[Warn] Board unchanged after attempting {previous_first_move}; "
+                      f"excluding it and re-solving.")
+                log_event("move_stuck_excluding", cycle=cycle_number, move=previous_first_move)
+                excluded_first_moves.add(previous_first_move)
+            else:
+                excluded_first_moves = set()
+            previous_solver_signature = current_solver_signature
+            previous_first_move = None
+
             solved = False  # monte-carlo doesn't track full-game-solved status; only "search" sets this
 
             if args.solver == "monte-carlo":
@@ -624,6 +649,7 @@ def main():
                     initial_stock_total=STOCK_TOTAL,
                     initial_found=found,
                     time_limit=5.0,
+                    excluded_first_moves=excluded_first_moves,
                 )
                 solver_seconds = time.perf_counter() - solver_started
                 log_event(
@@ -640,6 +666,7 @@ def main():
 
                 if path:
                     batch = path if args.moves_per_cycle <= 0 else path[:args.moves_per_cycle]
+                    previous_first_move = batch[0]
                     print(f"[*] Executing {len(batch)} move(s) this cycle:")
                     batch_completed = True
                     for idx, move in enumerate(batch):
