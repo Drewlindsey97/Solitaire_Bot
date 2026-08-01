@@ -50,11 +50,23 @@ STOCK_TOTAL = 24
 # the game itself decides which behavior applies.
 STOCK_TAP_X, STOCK_TAP_Y = 662, 368
 
+from pathlib import Path
+
 def load_templates(folder):
+    # Resolve folder relative to this module file so imports from other
+    # working directories still find the packaged template images.
+    base = Path(__file__).parent
+    search_dir = base / folder
     t = {}
-    for path in glob.glob(f"{folder}/*.png"):
+    if not search_dir.exists():
+        # graceful: return empty dict and let callers handle missing templates
+        return t
+    for path in glob.glob(str(search_dir / "*.png")):
         name = os.path.splitext(os.path.basename(path))[0]
         gray = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            # skip unreadable files
+            continue
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         t[name] = binary
     return t

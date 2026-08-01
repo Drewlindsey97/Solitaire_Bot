@@ -46,18 +46,27 @@ def make_heuristic(total_cards):
         base = total_cards - on_found
 
         penalty = 0
+        hidden_remaining = 0
         for col in state.cols:
             for i, card in enumerate(col):
                 if card == UNKNOWN:
+                    hidden_remaining += 1
                     continue
                 r, s = card
                 needed = found.get(s, -1) + 1
                 if rank_val(r) == needed and i != len(col) - 1:
-                    penalty += (len(col) - 1 - i) * 2
+                    # penalize burying a card that could immediately go to foundation
+                    penalty += (len(col) - 1 - i) * 4  # stronger penalty
 
-        empty_bonus = sum(1 for c in state.cols if not c) * 3
+        # reward empty columns more strongly (enables King staging)
+        empty_bonus = sum(1 for c in state.cols if not c) * 8
+        # small reward for having many revealed (playable) tops
+        revealed_tops = sum(1 for c in state.cols if c and c[-1] != UNKNOWN)
+        reveal_bonus = revealed_tops * 3
 
-        return max(0, base + penalty - empty_bonus)
+        # combine into a single scalar (lower is "worse" under original code,
+        # but solve() uses weight*heuristic as part of f; keep sign consistent)
+        return max(0, base + penalty - empty_bonus - hidden_remaining + reveal_bonus)
     return heuristic
 
 def can_stack(card, on_card):
@@ -258,8 +267,8 @@ def apply_move(state, move):
     return State(cols, waste, stock_remaining, state.stock_total, found)
 
 def solve(initial_cols, initial_waste=None, initial_stock_remaining=0, initial_stock_total=0,
-          initial_found=None, progress_every=100_000, max_seen=3_000_000, weight=5,
-          time_limit=100.0, excluded_first_moves=None):
+          initial_found=None, progress_every=100_000, max_seen=3_000_000, weight=12,
+          time_limit=100.0, excluded_first_moves=None, beam_width=5, transposition=True):
     """
     Weighted best-first search (f = g + weight*h) that runs until the game
     is won, every reachable state has been explored with no solution found
@@ -319,6 +328,17 @@ def solve(initial_cols, initial_waste=None, initial_stock_remaining=0, initial_s
     best_path = []
     best_h = heuristic(start)
 
+    # NOTE: Thread-safety not required. This solve() function runs single-threaded
+    # within a single search pass. The heur_cache and transposition tables are
+    # local to each solve() invocation and not shared across threads.
+    
+    # small cache for heuristic values to avoid repeated expensive scans
+    heur_cache = {start.key(): best_h}
+
+    # transposition table: map state.key() -> best seen g (path length)
+    # Single-threaded access only; no synchronization needed.
+    transpo = {} if transposition else None
+
     explored = 0
     start_time = time.time()
 
@@ -331,7 +351,12 @@ def solve(initial_cols, initial_waste=None, initial_stock_remaining=0, initial_s
             print(f"  ...explored {explored} states, {len(open_set)} queued, "
                   f"best remaining={best_h}, {elapsed:.0f}s elapsed")
 
-        h = heuristic(state)
+        key = state.key()
+        h = heur_cache.get(key)
+        if h is None:
+            h = heuristic(state)
+            heur_cache[key] = h
+
         if h < best_h:
             best_h = h
             best_path = path
@@ -358,12 +383,54 @@ def solve(initial_cols, initial_waste=None, initial_stock_remaining=0, initial_s
             return best_path, explored, False, "capped"
 
         moves = generate_moves(state, exclude=excluded_first_moves if not path else None)
+        # Score and order moves to improve convergence: prefer reveals and safe-foundation plays
+        g = len(path) + 1
+        scored = []
         for move in moves:
-            new_state = apply_move(state, move)
-            g = len(path) + 1
+            try:
+                new_state = apply_move(state, move)
+            except Exception:
+                continue
+            # immediate bonuses
+            bonus = 0
+            if move[0] in ("col_to_found", "waste_to_found"):
+                bonus += 80
+            if move[0] in ("col_to_col", "waste_to_col"):
+                # prefer moves that uncover a hidden (UNKNOWN) card at the source
+                if move[0] == "col_to_col":
+                    src = move[1]
+                    run_len = move[4] if len(move) > 4 else 1
+                    try:
+                        src_col = state.cols[src]
+                        # if there is a hidden card just above the moved run, reward
+                        if len(src_col) > run_len and src_col[-run_len - 1] == UNKNOWN:
+                            bonus += 300
+                    except Exception:
+                        pass
             hh = heuristic(new_state)
-            f = g + weight * hh
+            # lower hh is better; convert to a score where higher is better
+            score = - (weight * hh + g) + bonus
+            scored.append((score, new_state, move))
+        # explore best-scoring children first
+        scored.sort(reverse=True, key=lambda x: x[0])
+        # Beam pruning: limit expansion to top-N children per node to focus search.
+        # Only the best-scoring moves (by heuristic + bonus) are explored further.
+        # This reduces branching factor significantly for faster convergence.
+        if beam_width is not None and beam_width > 0:
+            scored = scored[:beam_width]
+        for score, new_state, move in scored:
+            f = g + weight * heuristic(new_state)
             k = new_state.key()
+            # Transposition table check: skip if we have already seen this state
+            # with an equal or better (smaller) g value. This avoids re-exploring
+            # the same state reached via different paths if the new path is no better.
+            # Pattern: if transpo.get(k, +inf) <= g, skip; else transpo[k] = g.
+            if transpo is not None:
+                prev_g = transpo.get(k)
+                if prev_g is not None and prev_g <= g:
+                    continue
+                transpo[k] = g
+            # keep 'seen' mapping for max_seen accounting and older code paths
             if k not in seen or seen[k] > g:
                 seen[k] = g
                 heapq.heappush(open_set, (f, next(counter), new_state, path + [move]))

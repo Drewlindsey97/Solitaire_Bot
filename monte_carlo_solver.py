@@ -103,35 +103,48 @@ def evaluate_state(state: State, expected_total: int) -> float:
 
 def move_priority(state: State, move: tuple) -> float:
     """
-    Give the rollout policy a mild preference for productive moves.
+    Give the rollout policy a stronger preference for productive moves.
 
-    This does not choose the final move. It only makes random simulations
-    less likely to spend all their time shuffling cards pointlessly.
+    Prefer: safe foundation plays, moves that reveal hidden cards or create
+    empty tableau columns, and waste-to-col moves that expose more waste.
+    De-prioritize draws/redeals unless no other options exist.
     """
     kind = move[0]
 
     priority = 1.0
 
     if kind in ("col_to_found", "waste_to_found"):
-        priority += 12.0
+        priority += 40.0
 
     elif kind == "waste_to_col":
-        priority += 5.0
+        priority += 12.0
 
     elif kind == "col_to_col":
-        priority += 3.0
+        priority += 8.0
 
     elif kind in ("draw", "redeal"):
-        # Lowest priority, matching their status as fallback-only moves in
-        # generate_moves() - a hypothetical draw/redeal never reveals
-        # anything the rollout can act on (see UNKNOWN in freecell_solver).
-        priority += 0.5
+        # Lowest priority; only use when necessary
+        priority += 0.1
 
     try:
         next_state = apply_move(state, move)
 
-        if count_empty_columns(next_state) > count_empty_columns(state):
-            priority += 4.0
+        # Reward creating empty columns
+        empty_before = count_empty_columns(state)
+        empty_after = count_empty_columns(next_state)
+        if empty_after > empty_before:
+            priority += 25.0
+
+        # Reward revealing hidden (UNKNOWN) cards
+        hidden_before = sum(1 for col in state.cols for c in col if c == ('?', '?') or c == ('?', '?'))
+        hidden_after = sum(1 for col in next_state.cols for c in col if c == ('?', '?') or c == ('?', '?'))
+        # If hidden count decreases, big bonus
+        if hidden_after < hidden_before:
+            priority += 80.0
+
+        # Reward moves that increase mobility
+        if mobility(next_state) > mobility(state):
+            priority += 6.0
 
     except (IndexError, KeyError, ValueError):
         return 0.0
@@ -160,7 +173,7 @@ def rollout(
     starting_state: State,
     expected_total: int,
     rng: random.Random,
-    max_depth: int,
+    max_depth: int = 1000,
 ) -> tuple[float, bool, int]:
     """
     Play a randomized simulated continuation.
@@ -225,9 +238,9 @@ def rollout(
 
 def choose_move_monte_carlo(
     state: State,
-    simulations: int = 1_000,
-    time_limit: float = 3.0,
-    max_depth: int = 100,
+    simulations: int = 10_000,
+    time_limit: float = 30.0,
+    max_depth: int = 1000,
     seed: Optional[int] = None,
 ) -> tuple[Optional[tuple], list[MoveStatistics]]:
     """
@@ -236,22 +249,31 @@ def choose_move_monte_carlo(
     The simulation budget is distributed round-robin so every legal move
     receives trials instead of one move consuming the whole time limit.
     """
-    legal_moves = generate_moves(state)
+    # generate_moves() may force a single "safe autoplay" move and
+    # return early. For Monte Carlo we want the full set of possible moves
+    # (so rollouts can explore alternatives), but still consider safe plays
+    # as candidates. Build an "exclude" set of safe-autoplay moves so
+    # generate_moves won't short-circuit, then use that as the legal set.
+    from freecell_solver import is_safe_autoplay
+
+    found = state.found_dict()
+    safe_exclude = set()
+    for ci, col in enumerate(state.cols):
+        if col and is_safe_autoplay(col[-1], found):
+            safe_exclude.add(("col_to_found", ci, col[-1]))
+    waste_top = state.waste[-1] if state.waste else None
+    if waste_top is not None and is_safe_autoplay(waste_top, found):
+        safe_exclude.add(("waste_to_found", waste_top))
+
+    legal_moves = generate_moves(state, exclude=safe_exclude if safe_exclude else None)
 
     if not legal_moves:
         return None, []
 
+    # If only one legal move remains, just return it (cheap path)
     if len(legal_moves) == 1:
         only_move = legal_moves[0]
-
-        return only_move, [
-            MoveStatistics(
-                move=only_move,
-                visits=1,
-                wins=0,
-                total_score=0.0,
-            )
-        ]
+        return only_move, [MoveStatistics(move=only_move, visits=1, wins=0, total_score=0.0)]
 
     rng = random.Random(seed)
     expected_total = total_card_count(state)
