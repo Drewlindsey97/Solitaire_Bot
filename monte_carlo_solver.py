@@ -105,9 +105,9 @@ def move_priority(state: State, move: tuple) -> float:
     """
     Give the rollout policy a stronger preference for productive moves.
 
-    Prefer: safe foundation plays, moves that reveal hidden cards or create
-    empty tableau columns, and waste-to-col moves that expose more waste.
-    De-prioritize draws/redeals unless no other options exist.
+    Prefer: safe foundation plays, moves that create empty tableau columns,
+    and waste-to-col moves that expose more waste. De-prioritize
+    draws/redeals unless no other options exist.
     """
     kind = move[0]
 
@@ -134,13 +134,6 @@ def move_priority(state: State, move: tuple) -> float:
         empty_after = count_empty_columns(next_state)
         if empty_after > empty_before:
             priority += 25.0
-
-        # Reward revealing hidden (UNKNOWN) cards
-        hidden_before = sum(1 for col in state.cols for c in col if c == ('?', '?') or c == ('?', '?'))
-        hidden_after = sum(1 for col in next_state.cols for c in col if c == ('?', '?') or c == ('?', '?'))
-        # If hidden count decreases, big bonus
-        if hidden_after < hidden_before:
-            priority += 80.0
 
         # Reward moves that increase mobility
         if mobility(next_state) > mobility(state):
@@ -266,6 +259,11 @@ def choose_move_monte_carlo(
         safe_exclude.add(("waste_to_found", waste_top))
 
     legal_moves = generate_moves(state, exclude=safe_exclude if safe_exclude else None)
+    if safe_exclude:
+        # generate_moves() also strips `exclude` from its own result as a
+        # final filter, so re-add the safe autoplays it just removed - we
+        # only wanted to bypass the short-circuit, not drop them entirely.
+        legal_moves = list(legal_moves) + [m for m in safe_exclude if m not in legal_moves]
 
     if not legal_moves:
         return None, []

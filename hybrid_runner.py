@@ -44,7 +44,7 @@ def build_state_from_image(img_path):
     return cols, waste, stock_remaining, found
 
 
-def run_hybrid(img_path, mc_time=30.0, top_k=3, per_move_time=50.0, max_depth_search=180.0):
+def run_hybrid(img_path, mc_time=30.0, top_k=3, per_move_time=50.0, total_search_budget=180.0):
     print('Building state from', img_path)
     cols, waste, stock_remaining, found = build_state_from_image(img_path)
     state = State(cols, waste, stock_remaining, 24, found)
@@ -63,7 +63,7 @@ def run_hybrid(img_path, mc_time=30.0, top_k=3, per_move_time=50.0, max_depth_se
     total_start = time.time()
     for idx, m in enumerate(top_moves):
         elapsed = time.time() - total_start
-        remaining = max(0.0, 180.0 - elapsed)
+        remaining = max(0.0, total_search_budget - elapsed)
         allowed = min(per_move_time, remaining)
         if allowed <= 0:
             break

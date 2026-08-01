@@ -64,9 +64,9 @@ def make_heuristic(total_cards):
         revealed_tops = sum(1 for c in state.cols if c and c[-1] != UNKNOWN)
         reveal_bonus = revealed_tops * 3
 
-        # combine into a single scalar (lower is "worse" under original code,
-        # but solve() uses weight*heuristic as part of f; keep sign consistent)
-        return max(0, base + penalty - empty_bonus - hidden_remaining + reveal_bonus)
+        # solve() minimizes h (min-heap on f = g + weight*h), so a reward
+        # must subtract from h and a penalty must add to it.
+        return max(0, base + penalty - empty_bonus + hidden_remaining - reveal_bonus)
     return heuristic
 
 def can_stack(card, on_card):
@@ -307,9 +307,18 @@ def solve(initial_cols, initial_waste=None, initial_stock_remaining=0, initial_s
     real next step (or a genuine draw/redeal) instead.
 
     Returns (path, explored, solved_bool, status). status is one of
-    "solved", "exhausted" (proven unsolvable), "capped" (state-count limit
-    hit), or "timeout" (wall-clock limit hit) - for "capped" and "timeout",
-    the search was inconclusive and path is the best partial line seen.
+    "solved", "exhausted", "capped" (state-count limit hit), or "timeout"
+    (wall-clock limit hit) - for "capped" and "timeout", the search was
+    inconclusive and path is the best partial line seen.
+
+    "exhausted" means every state in the searched subspace was explored
+    with no solution found - proof of unsolvability only when beam_width
+    is None. With the default beam_width=5, each node only expands its
+    top-5 scored children, so "exhausted" instead means the beam-limited
+    subspace was exhausted; a winning line ranked outside the top 5 at
+    some node would never be found and can't be distinguished from a
+    truly unsolvable position. Pass beam_width=None for a complete search
+    when that guarantee matters more than search speed.
     """
     initial_waste = initial_waste or []
     initial_found = initial_found or {}
@@ -410,16 +419,17 @@ def solve(initial_cols, initial_waste=None, initial_stock_remaining=0, initial_s
             hh = heuristic(new_state)
             # lower hh is better; convert to a score where higher is better
             score = - (weight * hh + g) + bonus
-            scored.append((score, new_state, move))
+            scored.append((score, new_state, move, hh))
         # explore best-scoring children first
         scored.sort(reverse=True, key=lambda x: x[0])
         # Beam pruning: limit expansion to top-N children per node to focus search.
         # Only the best-scoring moves (by heuristic + bonus) are explored further.
-        # This reduces branching factor significantly for faster convergence.
+        # This reduces branching factor significantly for faster convergence, at
+        # the cost of completeness - see solve()'s docstring on beam_width.
         if beam_width is not None and beam_width > 0:
             scored = scored[:beam_width]
-        for score, new_state, move in scored:
-            f = g + weight * heuristic(new_state)
+        for score, new_state, move, hh in scored:
+            f = g + weight * hh
             k = new_state.key()
             # Transposition table check: skip if we have already seen this state
             # with an equal or better (smaller) g value. This avoids re-exploring

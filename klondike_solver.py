@@ -60,7 +60,7 @@ def valid_sequence(seq):
         upper = seq[i]
         r_lower = rank_val(lower[0])
         r_upper = rank_val(upper[0])
-        if r_upper != r_lower - 1:
+        if r_upper != r_lower + 1:
             return False
         if card_color(lower) == card_color(upper):
             return False
@@ -91,7 +91,7 @@ def generate_moves(state, draw_n=3):
                         continue
                     if fu2:
                         dest_top = fu2[-1]
-                        if rank_val(run[-1][0]) == rank_val(dest_top[0]) - 1 and card_color(run[-1]) != card_color(dest_top):
+                        if rank_val(run[0][0]) == rank_val(dest_top[0]) - 1 and card_color(run[0]) != card_color(dest_top):
                             moves.append(('col_to_col', i, j, tuple(run)))
                     else:
                         # empty destination: only allow if run starts with King
@@ -230,9 +230,11 @@ def solve(initial_state, time_limit=5.0):
             bonus = 0
             if m[0] in ('col_to_found','waste_to_found'):
                 bonus += 500
-            if m[0] in ('col_to_col', 'waste_to_col'):
-                # if move uncovers a faceDown, big bonus
-                if any(len(state.tableau[i][0])>0 and len(state.tableau[i][1])==1 for i in range(7) if i== (m[1] if m[0]=='col_to_col' else m[1])):
+            if m[0] == 'col_to_col':
+                # if the move uncovers a faceDown at the source, big bonus
+                src = m[1]
+                run_len = len(m[3])
+                if len(state.tableau[src][0]) > 0 and len(state.tableau[src][1]) == run_len:
                     bonus += 1000
             scored.append((sc+bonus, m, new))
         # sort descending

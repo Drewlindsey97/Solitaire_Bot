@@ -4,6 +4,7 @@
 Usage: python3 parallel_search.py <image-path> --workers N --time 180
 """
 import argparse
+import math
 import multiprocessing as mp
 import time
 from pathlib import Path
@@ -89,8 +90,10 @@ def main():
 
     start = time.time()
     try:
-        # Wait for results with a global timeout equal to args.time
-        results = results_async.get(timeout=args.time + 5)
+        # Pool runs tasks in batches of args.workers, so the global wait
+        # must cover every batch, not just one.
+        batches = math.ceil(len(legal) / args.workers)
+        results = results_async.get(timeout=batches * args.time + 5)
     except mp.TimeoutError:
         print('Global timeout reached; terminating workers')
         pool.terminate()
