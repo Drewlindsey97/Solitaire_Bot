@@ -9,7 +9,8 @@ from pathlib import Path
 from board_reader_lib import (
     read_board, TABLEAU_X, TABLEAU_Y_TOP, COL_WIDTH,
     FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
-    HIDDEN_CARD_H, STEP, STOCK_TOTAL, STOCK_TAP_X, STOCK_TAP_Y
+    HIDDEN_CARD_H, STEP, STOCK_TOTAL, STOCK_TAP_X, STOCK_TAP_Y,
+    MIN_FOUNDATION_SCORE,
 )
 from freecell_solver import State, solve, apply_move, rank_val, UNKNOWN
 
@@ -582,8 +583,18 @@ def main():
 
             found = {}
             for card in board["foundation"]:
-                if card and "suit" in card:
-                    found[card["suit"]] = rank_val(card["rank"])
+                if not card or "suit" not in card:
+                    continue
+                if card.get("score", 1.0) < MIN_FOUNDATION_SCORE:
+                    # A landing/score-popup animation can obscure a
+                    # foundation slot's crop entirely, producing a
+                    # confident-looking match against noise instead of the
+                    # real card - skip it rather than trust a bad rank/suit
+                    # this cycle; the next screen read (once the animation
+                    # settles) will pick it up correctly.
+                    print(f"[Warn] foundation: low-confidence read {card!r}; skipping this cycle")
+                    continue
+                found[card["suit"]] = rank_val(card["rank"])
 
             # Every real card is accounted for in exactly one of: dealt into
             # a column (revealed or still face-down, both counted above),

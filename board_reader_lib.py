@@ -39,6 +39,14 @@ SLOT_W, SLOT_H = 95, 90
 WASTE_SCAN_X0, WASTE_SCAN_X1 = 410, 650
 WASTE_PEAK_THRESHOLD = 0.65
 
+# A card's landing/score-popup animation can briefly obscure a foundation
+# slot's rank+suit crop entirely, producing a match against noise instead
+# of the real card - confirmed live at score 0.24 for a slot fully covered
+# by a "+20" popup graphic. Genuine-but-weak matches on stable frames were
+# observed as low as 0.32, so the cutoff sits just under that to avoid
+# rejecting real reads while still catching animation-obscured garbage.
+MIN_FOUNDATION_SCORE = 0.3
+
 # Confirmed live by tapping through an entire stock cycle: 24 cards, drawn
 # 3 at a time (8 taps to exhaust), then an unlimited, deterministic redeal
 # (the same 24 cards return in the same order every cycle). The deal shape
@@ -77,11 +85,22 @@ SUIT_TEMPLATES = load_templates("suit_templates")
 
 def classify_suit_color(patch):
     gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-    mask = gray < 200
-    if mask.sum() < 5:
+    dark = gray < 200
+    n_dark = dark.sum()
+    if n_dark < 5:
         return "?"
-    b, g, r = patch[mask].mean(axis=0)
-    if r > g + 15 and r > b:
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    h, s = hsv[..., 0], hsv[..., 1]
+    # Genuine red ink is both a red hue (OpenCV hue wraps at 180, so true
+    # red sits at both ends: near 0 and near 179) AND heavily saturated.
+    # Hue alone isn't enough: a black pip's crop can contain comparably
+    # red-hued but much less saturated pixels (a card frame's brown corner
+    # shadow, or a gold/amber landing-animation glow bleeding in), which a
+    # looser saturation gate miscounts as red ink. Measured on real
+    # frames: confirmed black pips never exceeded ~15% strict-red-pixel
+    # share of the dark mask, while every confirmed red pip exceeded 55%.
+    red = dark & ((h <= 15) | (h >= 150)) & (s > 150)
+    if red.sum() / n_dark > 0.3:
         return "RED"
     return "BLACK"
 
