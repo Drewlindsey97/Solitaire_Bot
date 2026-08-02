@@ -21,7 +21,7 @@ for frame in ["Gameplay/frame_0001.png", "Gameplay/frame_0100.png"]:
         patch = img[SLOT_Y:SLOT_Y+SLOT_H, x:x+SLOT_W]
         gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
         name, score = match_rank(patch, TEMPLATES_LAST)
-        color = classify_suit_color(img[SLOT_Y+20:SLOT_Y+40, x+55:x+90])
+        color, color_confident = classify_suit_color(img[SLOT_Y+20:SLOT_Y+40, x+55:x+90])
         
         # Calculate scores for all templates to inspect ranking
         scores = {}

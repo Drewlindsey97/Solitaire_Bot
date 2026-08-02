@@ -13,6 +13,7 @@ from board_reader_lib import (
     MIN_FOUNDATION_SCORE,
 )
 from freecell_solver import State, solve, apply_move, rank_val, UNKNOWN
+from solver_state import build_solver_state
 
 from monte_carlo_solver import (
     choose_move_monte_carlo,
@@ -115,7 +116,18 @@ def get_element_coords(board, item_type, index, depth_from_bottom=0):
             revealed_count = num_cards - hidden_count
             y_edge = TABLEAU_Y_TOP + hidden_count * HIDDEN_CARD_H \
                 + max(0, revealed_count - 1 - depth_from_bottom) * STEP
-            y_center = y_edge + SLOT_H / 2
+            # Only the bottom-most card (depth 0) renders at its full
+            # height - every card above it in the stack is overlapped by
+            # the one below it, so only a STEP-tall sliver is actually
+            # visible/tappable there. Centering with the full SLOT_H
+            # offset overshoots past that sliver into the next card's
+            # territory - confirmed live: every multi-card run source
+            # (depth_from_bottom > 0) was grabbing the card one position
+            # below the intended one, and only single-card moves
+            # (depth_from_bottom == 0, always the fully-visible bottom
+            # card) were unaffected.
+            band_height = SLOT_H if depth_from_bottom == 0 else STEP
+            y_center = y_edge + band_height / 2
         return int(x_center), int(y_center)
 
     elif item_type == "waste":
@@ -308,6 +320,81 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
 # ==============================================================================
 # 4. MAIN LOOP
 # ==============================================================================
+def reconcile_foundation_reads(board, accepted, pending, max_jump, emit):
+    """Validate this frame's foundation reads against foundation physics.
+
+    Score thresholds alone cannot separate animation garbage from genuine
+    reads (corpus-measured: garbage scores up to 0.72, genuine reads as low
+    as 0.32) - but physics can: within a run a foundation slot's suit never
+    changes, its pile never shrinks, and it can only grow by as many cards
+    as could have been played since the last read. Reads that violate this
+    are rejected and the last accepted value is carried forward, so a
+    transient popup can't corrupt the solver state OR flap the board
+    signature the stuck-move detector depends on. A rejected value seen on
+    two consecutive reliable reads is accepted anyway (a legitimate big
+    jump, or the user started a new game) so a wrong rejection can't stick
+    forever.
+
+    accepted: slot_idx -> last trusted card dict, or None for observed-empty;
+              a slot missing from the dict has never been observed, and its
+              first reliable read is accepted as baseline.
+    pending:  slot_idx -> [candidate, consecutive_count] for reads awaiting
+              second-sighting confirmation.
+    Mutates board["foundation"] in place; returns a list of trust notes
+    (empty when every slot was consistent).
+    """
+    notes = []
+    slots = board.get("foundation", [])
+    for i, card in enumerate(slots):
+        if card is not None and not card.get("reliable", False):
+            # Untrusted read (obscured/ambiguous crop): substitute the last
+            # accepted value; don't touch pending - unreliable frames are
+            # transient and shouldn't break a confirmation streak.
+            prev = accepted.get(i)
+            slots[i] = dict(prev, carried=True) if prev else None
+            if prev:
+                emit("foundation_read_carried", slot=i, untrusted=card, using=prev)
+            else:
+                notes.append(f"foundation slot {i}: untrusted read {card!r} with no history")
+                emit("foundation_read_untrusted_no_history", slot=i, untrusted=card)
+            continue
+
+        read_key = (card["suit"], rank_val(card["rank"])) if card else None
+        if i not in accepted:
+            accepted[i] = dict(card) if card else None
+            continue
+
+        prev = accepted[i]
+        prev_rv = rank_val(prev["rank"]) if prev else -1
+        if read_key is None:
+            compatible = prev is None  # an established pile never empties mid-run
+        else:
+            suit, rv = read_key
+            same_suit = prev is None or prev["suit"] == suit
+            compatible = same_suit and 0 <= rv - prev_rv <= max_jump
+
+        if compatible:
+            accepted[i] = dict(card) if card else None
+            pending.pop(i, None)
+            continue
+
+        entry = pending.get(i)
+        if entry and entry[0] == read_key:
+            entry[1] += 1
+        else:
+            entry = pending[i] = [read_key, 1]
+        if entry[1] >= 2:
+            accepted[i] = dict(card) if card else None
+            pending.pop(i, None)
+            emit("foundation_read_accepted_after_confirmation", slot=i, value=read_key)
+            continue
+
+        slots[i] = dict(prev, carried=True) if prev else None
+        emit("foundation_read_rejected", slot=i, rejected=read_key,
+             keeping=(prev["suit"], rank_val(prev["rank"])) if prev else None)
+    return notes
+
+
 def count_unresolved_cards(board):
     unresolved = 0
     for idx in range(7):
@@ -341,9 +428,36 @@ def main():
     parser.add_argument(
         "--interval",
         type=float,
-        default=1.5,
+        default=None,
         help="Seconds to wait after a batch of moves for the UI to settle before the next "
-             "screen capture. Default: 1.5.",
+             "screen capture. Default: 1.5 (0.5 with --fast).",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Faster pacing profile: ~500ms swipes, 0.85-1.0s inter-gesture pauses, no "
+             "scan pauses, and a 0.5s --interval default. The pause floor is the game's "
+             "card-settle animation (see bridge.wait_human_delay) - pauses cut below it "
+             "made batched moves silently fail in live runs, so --fast shaves pacing "
+             "without undercutting it. If moves start silently failing anyway (repeated "
+             "'Board unchanged after attempting' warnings), drop this flag or raise "
+             "--swipe-ms / --gesture-delay.",
+    )
+    parser.add_argument(
+        "--swipe-ms",
+        type=int,
+        default=None,
+        help="Swipe gesture duration in milliseconds. Default: ~800 (~500 with --fast). "
+             "Swipes much faster than ~700ms were observed not registering as drags; "
+             "500 needs on-device verification.",
+    )
+    parser.add_argument(
+        "--gesture-delay",
+        type=float,
+        default=None,
+        help="Fixed pause in seconds after each tap/swipe, overriding the profile's "
+             "range. Use to bisect the device's real card-settle floor (0.2-0.8s was "
+             "observed too short; 0.9-1.5s is known good).",
     )
     parser.add_argument(
         "--solver",
@@ -383,6 +497,17 @@ def main():
         help="Clear the Android log buffer before capture starts."
     )
     args = parser.parse_args()
+
+    if args.interval is None:
+        args.interval = 0.5 if args.fast else 1.5
+    if args.fast:
+        bridge.configure_timing(
+            swipe_ms=500, delay_min=0.85, delay_max=1.0, scan_pause_chance=0.0,
+        )
+    if args.swipe_ms is not None:
+        bridge.configure_timing(swipe_ms=args.swipe_ms)
+    if args.gesture_delay is not None:
+        bridge.configure_timing(delay_min=args.gesture_delay, delay_max=args.gesture_delay)
 
     sim_mode = args.sim is not None
     screenshot_file = args.sim if sim_mode else "live_screen.png"
@@ -454,6 +579,15 @@ def main():
     # above never fires), but it just walks the board back to a state
     # already visited a few cycles ago instead of making progress.
     recent_board_signatures = deque(maxlen=10)
+    # Temporal foundation tracking (see reconcile_foundation_reads): the
+    # jump cap is how many foundation plays could legitimately happen
+    # between two reads - a full batch plus a couple of game-side
+    # auto-completes. With batch 0 (execute the whole path) any jump is
+    # possible, so the cap is effectively off.
+    foundation_accepted = {}
+    foundation_pending = {}
+    foundation_max_jump = (args.moves_per_cycle + 2) if args.moves_per_cycle > 0 else 52
+    consecutive_unreliable_frames = 0
 
     try:
         if logcat_monitor is not None:
@@ -554,57 +688,63 @@ def main():
 
             assign_pseudo_suits(board)
 
-            cols = []
-            truncated_columns = []
-            for idx in range(7):
-                col = []
-                for card in board[f"col{idx}"]:
-                    if card and card.get("rank") == "?" and card.get("color") == "?":
-                        # face-down card - identity unknown until the game
-                        # reveals it, but it still occupies a real slot in
-                        # this column (it's not empty just because nothing
-                        # revealed is left in it), so it can't just be
-                        # dropped from the column like the old FreeCell
-                        # model did (FreeCell has no hidden cards at all).
-                        col.append(UNKNOWN)
-                        continue
-                    if card and "suit" in card:
-                        col.append((card["rank"], card["suit"]))
-                    else:
-                        print(f"[Warn] col{idx}: unresolved card {card!r}; truncating column read here")
-                        truncated_columns.append(idx)
-                        break
-                cols.append(col)
+            def emit_trust(event_name, **data):
+                log_event(event_name, cycle=cycle_number, **data)
 
-            waste = []
-            for card in board["waste"]:
-                if card and "suit" in card:
-                    waste.append((card["rank"], card["suit"]))
+            trust_notes = reconcile_foundation_reads(
+                board, foundation_accepted, foundation_pending,
+                foundation_max_jump, emit_trust,
+            )
 
-            found = {}
-            for card in board["foundation"]:
-                if not card or "suit" not in card:
-                    continue
-                if card.get("score", 1.0) < MIN_FOUNDATION_SCORE:
-                    # A landing/score-popup animation can obscure a
-                    # foundation slot's crop entirely, producing a
-                    # confident-looking match against noise instead of the
-                    # real card - skip it rather than trust a bad rank/suit
-                    # this cycle; the next screen read (once the animation
-                    # settles) will pick it up correctly.
-                    print(f"[Warn] foundation: low-confidence read {card!r}; skipping this cycle")
-                    continue
-                found[card["suit"]] = rank_val(card["rank"])
+            state = build_solver_state(board, stock_total=STOCK_TOTAL)
+            cols = state["cols"]
+            waste = state["waste"]
+            found = state["found"]
+            stock_remaining = state["stock_remaining"]
+            truncated_columns = state["truncated_columns"]
+            issues = trust_notes + state["issues"]
+            for msg in issues:
+                print(f"[Warn] {msg}")
 
-            # Every real card is accounted for in exactly one of: dealt into
-            # a column (revealed or still face-down, both counted above),
-            # sitting in the waste, on a foundation, or still undrawn in
-            # stock - so whatever's left over after the first three must be
-            # in stock. This is self-correcting every cycle from a fresh
-            # board read rather than a tap-counter that could drift if a
-            # tap is missed or mistimed.
-            stock_remaining = 52 - sum(len(c) for c in cols) - len(waste) \
-                - sum(v + 1 for v in found.values())
+            # A single 52-card deck can never over- or under-account for its
+            # cards - stock_remaining outside [0, STOCK_TOTAL] means the CV
+            # read itself is corrupted (e.g. a garbled screenshot right
+            # after a device reconnect made detect_column_height()
+            # hallucinate a column dozens of cards deep, or a whole
+            # foundation pile was dropped from the read), not that the board
+            # is in a strange but real state. Solving/executing against a
+            # hallucinated board computes tap coordinates for cards that
+            # don't exist at those positions - confirmed live: this silently
+            # sent taps outside the tableau entirely and backed out of the
+            # game. Treat it like a failed capture/read and retry. Lesser
+            # trust problems (a truncated column, an unresolved waste card)
+            # get a couple of quick re-reads - animations settle in about a
+            # second - before proceeding best-effort so a persistent quirk
+            # can't stall the loop forever.
+            stock_impossible = stock_remaining < 0 or stock_remaining > STOCK_TOTAL
+            if not sim_mode and (
+                stock_impossible or (issues and consecutive_unreliable_frames < 2)
+            ):
+                consecutive_unreliable_frames += 1
+                print(f"[Warn] Unreliable board read "
+                      f"(stock_remaining={stock_remaining}); "
+                      f"discarding this cycle and re-reading.")
+                log_event(
+                    "board_read_unreliable",
+                    cycle=cycle_number,
+                    issues=issues,
+                    stock_remaining=stock_remaining,
+                    stock_impossible=stock_impossible,
+                    consecutive=consecutive_unreliable_frames,
+                )
+                time.sleep(3.0 if stock_impossible else 1.5)
+                continue
+            if not issues:
+                # only a clean frame re-arms the retry budget - a stable
+                # board quirk (e.g. a permanently ambiguous straddled crop)
+                # gets its two re-reads once, then proceeds best-effort
+                # every cycle instead of paying the retry tax forever
+                consecutive_unreliable_frames = 0
 
             print("[*] Formulated Solver State:")
             print(f"  Cols: {cols}")
@@ -619,6 +759,7 @@ def main():
                 foundations=found,
                 stock_remaining=stock_remaining,
                 truncated_columns=truncated_columns,
+                issues=issues,
             )
 
             # execute_move() only confirms a gesture was dispatched, not that
@@ -754,6 +895,34 @@ def main():
                           f"state; excluding it and re-solving.")
                     log_event("move_cycle_excluding", cycle=cycle_number, move=path[0])
                     cycle_guard_excluded.add(path[0])
+
+                    # This exclusion only lasts for the rest of *this*
+                    # cycle's retry loop (cycle_guard_excluded is rebuilt
+                    # fresh next cycle) - when the only two productive-
+                    # looking moves are symmetric under the heuristic (e.g.
+                    # a red 6 that stacks equally well on either of two
+                    # black 7s), both get excluded here, attempts run out,
+                    # and the "proceeding with the best one found anyway"
+                    # fallback below just re-executes the same oscillation
+                    # next cycle. Track repeat offenders the same way the
+                    # stuck-move guard above does, so a move caught cycling
+                    # from this exact state several times gets permanently
+                    # excluded from it instead of oscillating forever.
+                    cycle_failure_key = (current_solver_signature, path[0])
+                    cycle_fail_count = move_failure_counts.get(cycle_failure_key, 0) + 1
+                    move_failure_counts[cycle_failure_key] = cycle_fail_count
+                    if cycle_fail_count >= MOVE_PERMANENT_EXCLUDE_THRESHOLD:
+                        print(f"[Warn] {path[0]} has now been caught cycling "
+                              f"{cycle_fail_count} times from this exact board "
+                              f"state; excluding it for this state.")
+                        log_event(
+                            "move_permanently_excluding",
+                            cycle=cycle_number,
+                            move=path[0],
+                            fail_count=cycle_fail_count,
+                            reason="cycling",
+                        )
+                        permanently_excluded_by_state.add(cycle_failure_key)
                 else:
                     print("[Warn] Could not find a non-cycling move after several "
                           "attempts; proceeding with the best one found anyway.")

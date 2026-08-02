@@ -64,9 +64,24 @@ def make_heuristic(total_cards):
         revealed_tops = sum(1 for c in state.cols if c and c[-1] != UNKNOWN)
         reveal_bonus = revealed_tops * 3
 
+        # A column whose current top card is UNKNOWN represents a hidden
+        # card now exposed and ready to be revealed by the next real
+        # screen-read - genuinely new information, distinct from
+        # hidden_remaining (constant no matter which column a hidden card
+        # sits in) and revealed_tops (nets to zero for this exact
+        # transition: the column that lost its known top is offset by
+        # wherever the moved run landed gaining one). Without this term,
+        # moving a run onto an empty column to uncover a hidden card
+        # underneath only ever looks worse than leaving the column empty
+        # (pure empty_bonus loss, no offsetting term) - confirmed live: a
+        # King run sat on top of a hidden card for many cycles instead of
+        # moving to a free column. Weighted above empty_bonus per column
+        # so uncovering a card wins the tradeoff against staying empty.
+        pending_reveal_bonus = sum(1 for c in state.cols if c and c[-1] == UNKNOWN) * 10
+
         # solve() minimizes h (min-heap on f = g + weight*h), so a reward
         # must subtract from h and a penalty must add to it.
-        return max(0, base + penalty - empty_bonus + hidden_remaining - reveal_bonus)
+        return max(0, base + penalty - empty_bonus + hidden_remaining - reveal_bonus - pending_reveal_bonus)
     return heuristic
 
 def can_stack(card, on_card):

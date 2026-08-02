@@ -26,6 +26,30 @@ HUMAN_MODE = True
 TAP_JITTER_RADIUS = 6
 SWIPE_JITTER_RADIUS = 15
 
+# Gesture pacing. Both floors are load-bearing, confirmed live: swipes much
+# faster than ~700ms don't register as drags, and inter-gesture pauses that
+# undercut the game's card-settle animation make later moves in a batch
+# silently fail (see wait_human_delay's docstring). Speed these up only via
+# configure_timing() / the bot's --fast / --swipe-ms / --gesture-delay
+# flags, and back off if moves stop landing.
+SWIPE_MS_MIN, SWIPE_MS_MAX = 700, 900
+DELAY_MIN_S, DELAY_MAX_S = 0.9, 1.5
+SCAN_PAUSE_CHANCE = 0.05
+
+def configure_timing(swipe_ms=None, delay_min=None, delay_max=None, scan_pause_chance=None):
+    """Override gesture pacing at runtime (used by the bot's --fast/--swipe-ms flags)."""
+    global SWIPE_MS_MIN, SWIPE_MS_MAX, DELAY_MIN_S, DELAY_MAX_S, SCAN_PAUSE_CHANCE
+    if swipe_ms is not None:
+        # keep the human-mode randomness as a ~±12% spread around the request
+        spread = max(1, swipe_ms // 8)
+        SWIPE_MS_MIN, SWIPE_MS_MAX = swipe_ms - spread, swipe_ms + spread
+    if delay_min is not None:
+        DELAY_MIN_S = delay_min
+    if delay_max is not None:
+        DELAY_MAX_S = delay_max
+    if scan_pause_chance is not None:
+        SCAN_PAUSE_CHANCE = scan_pause_chance
+
 # Detect if the runtime environment is Android (Pydroid 3, Termux, etc.)
 IS_ANDROID = os.path.exists("/system/bin/app_process") or "ANDROID_ROOT" in os.environ
 
@@ -118,9 +142,22 @@ def apply_jitter(val, radius):
     offset = int(random.gauss(0, radius / 2))
     return max(0, val + offset)
 
-def wait_human_delay(min_d=0.2, max_d=0.8):
-    """Sleeps a randomized delay. Adds an occasional scanning pause."""
-    if random.random() < 0.05:  # 5% chance of a realistic 'screen scanning' pause
+def wait_human_delay(min_d=None, max_d=None):
+    """Sleeps a randomized delay. Adds an occasional scanning pause.
+
+    Runs after every tap/swipe, including between moves within a
+    multi-move batch (see solitaire_auto_bot.py's --moves-per-cycle) - the
+    input event itself blocks until the touch/drag completes, but the
+    game's own card-settle/snap animation keeps playing after that. A
+    pause shorter than that animation lets the next gesture fire while a
+    card is still mid-animation, which can interrupt it (snapping back to
+    its origin) or land on a not-yet-stable layout - confirmed live: a
+    6-move batch's first two moves landed, then every move after that
+    silently failed once the pause was cut to 0.2-0.8s.
+    """
+    min_d = DELAY_MIN_S if min_d is None else min_d
+    max_d = DELAY_MAX_S if max_d is None else max_d
+    if random.random() < SCAN_PAUSE_CHANCE:  # occasional realistic 'screen scanning' pause
         scan_delay = random.uniform(1.2, 2.5)
         print(f"   [Human Mode] Pausing to scan screen for {scan_delay:.2f}s...")
         time.sleep(scan_delay)
@@ -162,7 +199,8 @@ def swipe(x1, y1, x2, y2):
     jx2 = apply_jitter(x2, SWIPE_JITTER_RADIUS) if HUMAN_MODE else x2
     jy2 = apply_jitter(y2, SWIPE_JITTER_RADIUS) if HUMAN_MODE else y2
 
-    duration_ms = random.randint(700, 900) if HUMAN_MODE else 800
+    duration_ms = random.randint(SWIPE_MS_MIN, SWIPE_MS_MAX) if HUMAN_MODE \
+        else (SWIPE_MS_MIN + SWIPE_MS_MAX) // 2
 
     if RUN_MODE == "HTTP_BRIDGE":
         print(f"Swipe from ({jx1}, {jy1}) to ({jx2}, {jy2}) via HTTP")
