@@ -153,7 +153,11 @@ def match_rank(patch, template_set):
         if score > best_score:
             best_score = score
             best_name = name
-    return best_name, best_score
+    # Rank templates support multiple named variants per rank, using the
+    # same file scheme suits already use ("2_live.png" is a variant of
+    # "2"): collapse the winning variant back to its base name.
+    # match_suit's own collapse then becomes a no-op, which is fine.
+    return best_name.split("_")[0], best_score
 
 # Suit templates (S/H/D/C) are matched with the exact same shape-matching
 # approach as rank templates - match_rank() is generic over its template
@@ -235,7 +239,13 @@ def detect_waste_slots(img):
                 j += 1
             peak = i + int(np.argmax(score[i:j]))
             x = WASTE_SCAN_X0 + peak - PAD
-            slots.append((x, str(name[peak]), round(float(score[peak]), 2)))
+            # A peak inside the left padding margin (x < WASTE_SCAN_X0)
+            # is matching zero-padding plus band-edge bleed, not a card -
+            # observed live as a phantom score-0 read at x=401 that taxed
+            # every cycle with unreliable-frame retries.
+            if peak >= PAD:
+                slots.append((x, str(name[peak]).split("_")[0],
+                              round(float(score[peak]), 2)))
             i = j
         else:
             i += 1
