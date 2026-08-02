@@ -12,6 +12,7 @@ from board_reader_lib import (
     HIDDEN_CARD_H, STEP, STOCK_TOTAL, STOCK_TAP_X, STOCK_TAP_Y,
 )
 from freecell_solver import State, solve, apply_move, rank_val, UNKNOWN
+import race_policy
 from solver_state import build_solver_state
 
 from monte_carlo_solver import (
@@ -471,9 +472,14 @@ def main():
     )
     parser.add_argument(
         "--solver",
-        choices=["search", "monte-carlo"],
+        choices=["search", "monte-carlo", "race"],
         default="search",
-        help="Choose the move-selection engine. Default: search."
+        help="Choose the move-selection engine. 'race' is the timed-round "
+             "policy: instant greedy selection (no search budget), strict "
+             "foundation > reveal > empty-column priority, refuses moves that "
+             "neither reveal nor found (the in-place shuffle), and plays "
+             "several moves per screen read. Use it when a countdown is "
+             "running - see race_policy.py. Default: search."
     )
     parser.add_argument(
         "--log-file",
@@ -846,7 +852,50 @@ def main():
 
             solved = False  # monte-carlo doesn't track full-game-solved status; only "search" sets this
 
-            if args.solver == "monte-carlo":
+            if args.solver == "race":
+                # Timed round: pick instantly and play a batch per screen
+                # read. No search budget - the clock is the scarce resource,
+                # and with face-down cards the search couldn't plan past the
+                # first one anyway (it reported "exhausted" every cycle).
+                solver_started = time.perf_counter()
+                state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
+                batch_cap = args.moves_per_cycle if args.moves_per_cycle > 0 else 8
+                batch = race_policy.plan_batch(
+                    state, max_moves=batch_cap, exclude=excluded_first_moves,
+                )
+                solver_seconds = time.perf_counter() - solver_started
+                log_event(
+                    "solver_finished",
+                    cycle=cycle_number,
+                    solver="race",
+                    duration_seconds=solver_seconds,
+                    path_length=len(batch),
+                    path=batch,
+                )
+                if batch:
+                    previous_first_move = batch[0]
+                    print(f"[*] Race: executing {len(batch)} move(s) this cycle:")
+                    for idx, move in enumerate(batch):
+                        print(f"  {idx + 1}. {move}")
+                        ok = execute_move(
+                            board, move, sim_mode=sim_mode, event_logger=log_event,
+                        )
+                        if ok and move[0] in ("col_to_found", "waste_to_found"):
+                            last_cycle_found_plays += 1
+                        log_event(
+                            "move_result", cycle=cycle_number, batch_index=idx,
+                            move=move, success=ok,
+                        )
+                        if not ok:
+                            print("[*] Stopping batch early; re-reading next cycle.")
+                            break
+                        if move[0] in ("draw", "redeal"):
+                            break
+                        apply_move_to_board(board, move)
+                else:
+                    print("[*] Race: no productive move available (board stuck).")
+                    log_event("no_move_selected", cycle=cycle_number, solver="race")
+            elif args.solver == "monte-carlo":
                 print("[*] Running Monte Carlo move search...")
                 solver_started = time.perf_counter()
                 state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
