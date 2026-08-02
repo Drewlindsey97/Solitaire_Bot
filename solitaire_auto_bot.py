@@ -459,6 +459,15 @@ def main():
              "--swipe-ms / --gesture-delay.",
     )
     parser.add_argument(
+        "--max-stuck-cycles",
+        type=int,
+        default=15,
+        help="Stop after this many consecutive reliable cycles with no board "
+             "progress (no card banked and no face-down card revealed). The "
+             "timed round does not auto-end, so without this a stuck endgame "
+             "spins forever redealing the stock. 0 disables. Default: 15.",
+    )
+    parser.add_argument(
         "--debug-draws",
         action="store_true",
         help="When race mode chooses to draw while the board has an open "
@@ -620,6 +629,13 @@ def main():
     debug_draw_count = 0
     consecutive_unreliable_frames = 0
     consecutive_impossible_frames = 0
+    # No-progress stop: this game's round doesn't auto-end (observed running
+    # 7+ min), so a stuck endgame otherwise spins forever redealing the stock.
+    # Track the best board progress seen (cards founded + cards revealed) and
+    # stop after a stretch long enough to have cycled the whole stock with no
+    # gain. 0 disables it (via --max-stuck-cycles).
+    best_progress = -1
+    cycles_without_progress = 0
     previous_issue_signature = None
 
     try:
@@ -802,6 +818,33 @@ def main():
                 # problems)
                 consecutive_unreliable_frames = 0
             last_cycle_found_plays = 0
+
+            # No-progress stop condition. Progress = cards banked plus cards
+            # revealed (columns get shorter / fewer face-down as the game
+            # opens up); either going up resets the stall counter. A reliable
+            # frame that improves neither, repeated past the limit, means the
+            # bot is cycling the stock with nothing left to do - stop rather
+            # than spin until (or past) the clock.
+            founded_count = sum(v + 1 for v in found.values()) if found else 0
+            face_down = sum(1 for c in cols for card in c if card == UNKNOWN)
+            progress = founded_count * 100 - face_down
+            if progress > best_progress:
+                best_progress = progress
+                cycles_without_progress = 0
+            else:
+                cycles_without_progress += 1
+            if (args.max_stuck_cycles > 0
+                    and cycles_without_progress >= args.max_stuck_cycles):
+                print(f"[*] No board progress for {cycles_without_progress} "
+                      f"cycles ({founded_count} cards on foundations); the "
+                      f"position looks stuck. Stopping.")
+                log_event(
+                    "stopped_no_progress",
+                    cycle=cycle_number,
+                    founded=founded_count,
+                    cycles_without_progress=cycles_without_progress,
+                )
+                break
 
             print("[*] Formulated Solver State:")
             print(f"  Cols: {cols}")
