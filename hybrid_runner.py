@@ -11,8 +11,9 @@ import sys
 import time
 from pathlib import Path
 
-from board_reader_lib import read_board
-from solitaire_auto_bot import assign_pseudo_suits, UNKNOWN, rank_val
+from board_reader_lib import read_board, STOCK_TOTAL
+from solitaire_auto_bot import assign_pseudo_suits
+from solver_state import build_solver_state
 from freecell_solver import State, apply_move, solve
 from monte_carlo_solver import choose_move_monte_carlo, print_statistics
 
@@ -20,34 +21,16 @@ from monte_carlo_solver import choose_move_monte_carlo, print_statistics
 def build_state_from_image(img_path):
     board = read_board(str(img_path))
     assign_pseudo_suits(board)
-    cols = []
-    for idx in range(7):
-        col = []
-        for card in board.get(f'col{idx}', []):
-            if card and card.get('rank') == '?' and card.get('color') == '?':
-                col.append(UNKNOWN)
-                continue
-            if card and 'suit' in card:
-                col.append((card['rank'], card['suit']))
-            else:
-                break
-        cols.append(col)
-    waste = []
-    for card in board.get('waste', []):
-        if card and 'suit' in card:
-            waste.append((card['rank'], card['suit']))
-    found = {}
-    for card in board.get('foundation', []):
-        if card and 'suit' in card:
-            found[card['suit']] = rank_val(card['rank'])
-    stock_remaining = 52 - sum(len(c) for c in cols) - len(waste) - sum(v+1 for v in found.values())
-    return cols, waste, stock_remaining, found
+    state = build_solver_state(board, stock_total=STOCK_TOTAL)
+    for msg in state['issues']:
+        print(f'[Warn] {msg}')
+    return state['cols'], state['waste'], state['stock_remaining'], state['found']
 
 
 def run_hybrid(img_path, mc_time=30.0, top_k=3, per_move_time=50.0, total_search_budget=180.0):
     print('Building state from', img_path)
     cols, waste, stock_remaining, found = build_state_from_image(img_path)
-    state = State(cols, waste, stock_remaining, 24, found)
+    state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
     print('State: cols=', [len(c) for c in cols], 'waste=', waste, 'found=', found)
 
     # 1) Monte Carlo ranking

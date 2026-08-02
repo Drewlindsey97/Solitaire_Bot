@@ -30,15 +30,32 @@ def load_templates(folder):
 templates = load_templates("templates")
 templates_last = load_templates("templates_last")
 
+_CANONICAL_CLASSIFY = None
+
 def classify_suit_color(patch):
-    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-    mask = gray < 200
-    if mask.sum() < 5:
-        return "?"
-    b, g, r = patch[mask].mean(axis=0)
-    if r > g + 15 and r > b:
-        return "RED"
-    return "BLACK"
+    # Stale local copy replaced by a delegate to the canonical classifier
+    # in the top-level board_reader_lib.py (this legacy script had drifted
+    # behind its fixes - it still used the old mean-BGR test). The
+    # canonical version returns (color, confident); legacy callers here
+    # only use the color string. Imported by file path because pipeline/
+    # has its own module named board_reader_lib.
+    global _CANONICAL_CLASSIFY
+    if _CANONICAL_CLASSIFY is None:
+        import importlib.util
+        from pathlib import Path
+        here = Path(__file__).resolve()
+        for cand in (here.parent / "board_reader_lib.py",
+                     here.parent.parent / "board_reader_lib.py"):
+            if cand.exists() and cand != here:
+                spec = importlib.util.spec_from_file_location("_canonical_brl", str(cand))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _CANONICAL_CLASSIFY = mod.classify_suit_color
+                break
+    res = _CANONICAL_CLASSIFY(patch)
+    # normalize: the canonical classifier returns (color, confident), but a
+    # delegate chained through another legacy delegate gets a plain string
+    return res[0] if isinstance(res, tuple) else res
 
 def match_rank(patch, template_set):
     gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)

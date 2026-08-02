@@ -4,3 +4,13 @@ __pycache__/
 *.pyc
 .claude/settings.local.json
 logs/
+debug_draws/
+
+# Runtime artifacts (regenerated every run - not source)
+live_screen.png
+board_state.json
+screen_tmp.png
+
+# Session diagnostics captured while debugging
+diag_*.png
+live_run.log

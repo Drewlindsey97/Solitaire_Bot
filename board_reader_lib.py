@@ -40,11 +40,15 @@ WASTE_SCAN_X0, WASTE_SCAN_X1 = 410, 650
 WASTE_PEAK_THRESHOLD = 0.65
 
 # A card's landing/score-popup animation can briefly obscure a foundation
-# slot's rank+suit crop entirely, producing a match against noise instead
-# of the real card - confirmed live at score 0.24 for a slot fully covered
-# by a "+20" popup graphic. Genuine-but-weak matches on stable frames were
-# observed as low as 0.32, so the cutoff sits just under that to avoid
-# rejecting real reads while still catching animation-obscured garbage.
+# slot's rank+suit crop, producing a match against noise instead of the
+# real card. This score cutoff is only a FIRST-line filter for the deepest
+# garbage (confirmed live at 0.24-0.25 for fully covered slots): measured
+# across the full Gameplay corpus, animation garbage also scores 0.32-0.72
+# (frame_0006 read a K-of-spades at 0.32 over a slot that really held a 3)
+# while genuine weak reads sit at 0.32-0.34, so score alone CANNOT separate
+# the two. The real defense is the temporal validation in
+# solitaire_auto_bot.py (foundations only grow, suits never change), which
+# rejects impossible jumps regardless of score.
 MIN_FOUNDATION_SCORE = 0.3
 
 # Confirmed live by tapping through an entire stock cycle: 24 cards, drawn
@@ -83,26 +87,57 @@ TEMPLATES = load_templates("templates")
 TEMPLATES_LAST = load_templates("templates_last")
 SUIT_TEMPLATES = load_templates("suit_templates")
 
+# Red-ink gate: red hue (OpenCV hue wraps at 180 - this game's red ink is
+# crimson at h~168, so the upper band must reach down to 150) AND heavily
+# saturated. Black-ink gate: dark and near-neutral (black ink and its gray
+# anti-aliasing have low saturation). Dark background content - green felt
+# (h~60-90, saturated), brown frame shadows, gold/amber popup glow - fails
+# both gates and is ignored entirely.
+RED_HUE_LO, RED_HUE_HI = 15, 150
+RED_SAT_MIN = 150
+BLACK_SAT_MAX = 60
+# Verdict cutoff: red-pixel share of ALL dark pixels. Corpus-measured
+# extremes are 0.276 (highest black pip, a straddled crop polluted by a
+# neighboring red pip) vs 0.308 (lowest genuine red pip, same straddle
+# problem in reverse) - NOT comfortably separated, which is why the
+# ambiguity band below exists.
+RED_SHARE_CUTOFF = 0.3
+# Confidence: share of red ink among ink pixels only (background excluded,
+# so occlusion can't dilute it). Measured across all 2,968 corpus crops,
+# 99% of reads sit outside [0.20, 0.55]; every crop inside the band was
+# either a crop straddling two cards' pips or animation garbage - exactly
+# the reads that must not be trusted silently.
+AMBIG_INK_FRAC_LO, AMBIG_INK_FRAC_HI = 0.20, 0.55
+MIN_INK_PIXELS = 5
+
 def classify_suit_color(patch):
+    """Classify a suit-pip crop as RED or BLACK.
+
+    Returns (color, confident). color is "RED"/"BLACK"/"?"; confident is
+    False when the ink evidence is mixed or absent - a crop straddling two
+    cards, an animation graphic covering the pip, or an empty crop - and
+    the caller must treat the read as unresolved (zero its score) rather
+    than trust the guess. A fully-covered slot (e.g. a "+20" popup) has no
+    ink at all, so this also catches obscured reads whose template score
+    happens to look plausible.
+    """
     gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
     dark = gray < 200
     n_dark = dark.sum()
     if n_dark < 5:
-        return "?"
+        return "?", False
     hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
     h, s = hsv[..., 0], hsv[..., 1]
-    # Genuine red ink is both a red hue (OpenCV hue wraps at 180, so true
-    # red sits at both ends: near 0 and near 179) AND heavily saturated.
-    # Hue alone isn't enough: a black pip's crop can contain comparably
-    # red-hued but much less saturated pixels (a card frame's brown corner
-    # shadow, or a gold/amber landing-animation glow bleeding in), which a
-    # looser saturation gate miscounts as red ink. Measured on real
-    # frames: confirmed black pips never exceeded ~15% strict-red-pixel
-    # share of the dark mask, while every confirmed red pip exceeded 55%.
-    red = dark & ((h <= 15) | (h >= 150)) & (s > 150)
-    if red.sum() / n_dark > 0.3:
-        return "RED"
-    return "BLACK"
+    red_ink = dark & ((h <= RED_HUE_LO) | (h >= RED_HUE_HI)) & (s > RED_SAT_MIN)
+    black_ink = dark & (s < BLACK_SAT_MAX)
+    n_red, n_black = int(red_ink.sum()), int(black_ink.sum())
+    if n_red + n_black < MIN_INK_PIXELS:
+        return "?", False
+    color = "RED" if n_red / n_dark > RED_SHARE_CUTOFF else "BLACK"
+    ink_frac = n_red / (n_red + n_black)
+    confident = (color == "RED" and ink_frac >= AMBIG_INK_FRAC_HI) or \
+                (color == "BLACK" and ink_frac <= AMBIG_INK_FRAC_LO)
+    return color, confident
 
 def match_rank(patch, template_set):
     gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
@@ -118,7 +153,11 @@ def match_rank(patch, template_set):
         if score > best_score:
             best_score = score
             best_name = name
-    return best_name, best_score
+    # Rank templates support multiple named variants per rank, using the
+    # same file scheme suits already use ("2_live.png" is a variant of
+    # "2"): collapse the winning variant back to its base name.
+    # match_suit's own collapse then becomes a no-op, which is fine.
+    return best_name.split("_")[0], best_score
 
 # Suit templates (S/H/D/C) are matched with the exact same shape-matching
 # approach as rank templates - match_rank() is generic over its template
@@ -137,8 +176,14 @@ def match_rank(patch, template_set):
 # card's best raw template score sometimes lands on a red suit) that pure
 # shape-matching over all 4 templates can't rule out on its own.
 def match_suit(patch, color, template_set=SUIT_TEMPLATES):
-    candidates = {"S", "C"} if color == "BLACK" else {"H", "D"} if color == "RED" else None
-    narrowed = template_set if candidates is None else {
+    if color not in ("BLACK", "RED"):
+        # Fail closed: with no color evidence, matching across all 4
+        # templates is exactly the cross-color mismatch the comment above
+        # says color-gating exists to prevent (near-tied spade/heart-class
+        # shapes), and the result could still carry a passable score.
+        return "?", 0.0
+    candidates = {"S", "C"} if color == "BLACK" else {"H", "D"}
+    narrowed = {
         name: tmpl for name, tmpl in template_set.items() if name.split("_")[0] in candidates
     }
     name, score = match_rank(patch, narrowed)
@@ -194,7 +239,13 @@ def detect_waste_slots(img):
                 j += 1
             peak = i + int(np.argmax(score[i:j]))
             x = WASTE_SCAN_X0 + peak - PAD
-            slots.append((x, str(name[peak]), round(float(score[peak]), 2)))
+            # A peak inside the left padding margin (x < WASTE_SCAN_X0)
+            # is matching zero-padding plus band-edge bleed, not a card -
+            # observed live as a phantom score-0 read at x=401 that taxed
+            # every cycle with unreliable-frame retries.
+            if peak >= PAD:
+                slots.append((x, str(name[peak]).split("_")[0],
+                              round(float(score[peak]), 2)))
             i = j
         else:
             i += 1
@@ -276,7 +327,7 @@ def read_board(frame_path):
             # "last" card - both render the small rank+suit index at the
             # same relative position, so one crop formula covers both.
             suit_patch = img[y+SUIT_Y_OFF:y+SUIT_Y_OFF+SUIT_H, x+SUIT_X_OFF:x+SUIT_X_OFF+SUIT_W]
-            color = classify_suit_color(suit_patch)
+            color, color_confident = classify_suit_color(suit_patch)
             suit, suit_score = match_suit(suit_patch, color)
 
             if is_last:
@@ -291,7 +342,11 @@ def read_board(frame_path):
             # a top offset that doesn't cleanly fit a whole number of hidden
             # cards means this frame is mid-animation, not a stable state -
             # every row crop here is misaligned regardless of match_rank's score
-            if not reliable:
+            # mixed red/black ink evidence (a crop straddling two cards, or
+            # an animation graphic over the pip) means the color - and so
+            # the suit - is a coin flip; zero the score so state builders
+            # treat the card as unresolved instead of trusting a guess
+            if not reliable or not color_confident:
                 score = 0.0
 
             col_cards.append({"rank": name, "suit": suit, "color": color, "score": round(float(score), 2)})
@@ -305,10 +360,16 @@ def read_board(frame_path):
             return None
         name, score = match_rank(patch, TEMPLATES_LAST)
         suit_patch = img[SLOT_Y+SUIT_Y_OFF:SLOT_Y+SUIT_Y_OFF+SUIT_H, x+SUIT_X_OFF:x+SUIT_X_OFF+SUIT_W]
-        color = classify_suit_color(suit_patch)
+        color, color_confident = classify_suit_color(suit_patch)
         suit, suit_score = match_suit(suit_patch, color)
         score = min(score, suit_score)
-        return {"rank": name, "suit": suit, "color": color, "score": round(float(score), 2)}
+        # reliable is the producer-side trust verdict every consumer should
+        # honor (build_solver_state does): an occupied-looking slot whose
+        # ink evidence is mixed/absent or whose score is below the
+        # first-line cutoff must not be trusted as a real card this frame.
+        reliable = bool(color_confident and score >= MIN_FOUNDATION_SCORE)
+        return {"rank": name, "suit": suit, "color": color,
+                "score": round(float(score), 2), "reliable": reliable}
 
     # Foundation piles are 4 separate, non-overlapping boxes (unlike the
     # fanned waste pile below), so the same per-x read_slot() used for
@@ -318,9 +379,11 @@ def read_board(frame_path):
     waste = []
     for x, rank, rank_score in detect_waste_slots(img):
         suit_patch = img[SLOT_Y+SUIT_Y_OFF:SLOT_Y+SUIT_Y_OFF+SUIT_H, x+SUIT_X_OFF:x+SUIT_X_OFF+SUIT_W]
-        color = classify_suit_color(suit_patch)
+        color, color_confident = classify_suit_color(suit_patch)
         suit, suit_score = match_suit(suit_patch, color)
         score = min(rank_score, suit_score)
+        if not color_confident:
+            score = 0.0
         # keep the source x so callers can find the current playable
         # (frontmost = last = highest x) card's tap/swipe position
         waste.append({"rank": rank, "suit": suit, "color": color, "score": round(float(score), 2), "x": x})
