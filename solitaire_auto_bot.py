@@ -10,7 +10,6 @@ from board_reader_lib import (
     read_board, TABLEAU_X, TABLEAU_Y_TOP, COL_WIDTH,
     FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
     HIDDEN_CARD_H, STEP, STOCK_TOTAL, STOCK_TAP_X, STOCK_TAP_Y,
-    MIN_FOUNDATION_SCORE,
 )
 from freecell_solver import State, solve, apply_move, rank_val, UNKNOWN
 from solver_state import build_solver_state
@@ -320,7 +319,15 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
 # ==============================================================================
 # 4. MAIN LOOP
 # ==============================================================================
-def reconcile_foundation_reads(board, accepted, pending, max_jump, emit):
+# How long a history-contradicting foundation value must persist before we
+# believe it over the history. Two quick sightings are NOT independent
+# evidence - the unreliable-frame retry path re-reads just 1.5s apart, so an
+# animation overlay lasting ~3s would "confirm" itself under a count-based
+# rule. Real board changes persist indefinitely; overlays don't.
+FOUNDATION_CONFIRM_SECONDS = 5.0
+
+
+def reconcile_foundation_reads(board, accepted, pending, max_jump, emit, now):
     """Validate this frame's foundation reads against foundation physics.
 
     Score thresholds alone cannot separate animation garbage from genuine
@@ -330,16 +337,16 @@ def reconcile_foundation_reads(board, accepted, pending, max_jump, emit):
     as could have been played since the last read. Reads that violate this
     are rejected and the last accepted value is carried forward, so a
     transient popup can't corrupt the solver state OR flap the board
-    signature the stuck-move detector depends on. A rejected value seen on
-    two consecutive reliable reads is accepted anyway (a legitimate big
-    jump, or the user started a new game) so a wrong rejection can't stick
-    forever.
+    signature the stuck-move detector depends on. A rejected value that
+    keeps being read for FOUNDATION_CONFIRM_SECONDS is accepted anyway (a
+    legitimate big jump, or the user started a new game) so a wrong
+    rejection can't stick forever.
 
     accepted: slot_idx -> last trusted card dict, or None for observed-empty;
               a slot missing from the dict has never been observed, and its
               first reliable read is accepted as baseline.
-    pending:  slot_idx -> [candidate, consecutive_count] for reads awaiting
-              second-sighting confirmation.
+    pending:  slot_idx -> [candidate, first_seen_monotonic] for reads
+              awaiting persistence confirmation.
     Mutates board["foundation"] in place; returns a list of trust notes
     (empty when every slot was consistent).
     """
@@ -380,18 +387,21 @@ def reconcile_foundation_reads(board, accepted, pending, max_jump, emit):
 
         entry = pending.get(i)
         if entry and entry[0] == read_key:
-            entry[1] += 1
+            if now - entry[1] >= FOUNDATION_CONFIRM_SECONDS:
+                accepted[i] = dict(card) if card else None
+                pending.pop(i, None)
+                emit("foundation_read_accepted_after_persistence", slot=i, value=read_key)
+                continue
         else:
-            entry = pending[i] = [read_key, 1]
-        if entry[1] >= 2:
-            accepted[i] = dict(card) if card else None
-            pending.pop(i, None)
-            emit("foundation_read_accepted_after_confirmation", slot=i, value=read_key)
-            continue
+            pending[i] = [read_key, now]
 
         slots[i] = dict(prev, carried=True) if prev else None
-        emit("foundation_read_rejected", slot=i, rejected=read_key,
-             keeping=(prev["suit"], rank_val(prev["rank"])) if prev else None)
+        prev_key = (prev["suit"], rank_val(prev["rank"])) if prev else None
+        notes.append(
+            f"foundation slot {i}: read {read_key} contradicts history "
+            f"{prev_key}; keeping last known value"
+        )
+        emit("foundation_read_rejected", slot=i, rejected=read_key, keeping=prev_key)
     return notes
 
 
@@ -580,14 +590,18 @@ def main():
     # already visited a few cycles ago instead of making progress.
     recent_board_signatures = deque(maxlen=10)
     # Temporal foundation tracking (see reconcile_foundation_reads): the
-    # jump cap is how many foundation plays could legitimately happen
-    # between two reads - a full batch plus a couple of game-side
-    # auto-completes. With batch 0 (execute the whole path) any jump is
-    # possible, so the cap is effectively off.
+    # jump cap is how many foundation plays could legitimately happen since
+    # the previous read - the *_to_found moves actually executed last cycle
+    # plus a couple of game-side auto-completes. Deriving it from executed
+    # moves (rather than the --moves-per-cycle setting) keeps the physics
+    # filter tight even with batch 0, where a whole winning path can run in
+    # one cycle.
     foundation_accepted = {}
     foundation_pending = {}
-    foundation_max_jump = (args.moves_per_cycle + 2) if args.moves_per_cycle > 0 else 52
+    last_cycle_found_plays = 0
     consecutive_unreliable_frames = 0
+    consecutive_impossible_frames = 0
+    previous_issue_signature = None
 
     try:
         if logcat_monitor is not None:
@@ -693,7 +707,7 @@ def main():
 
             trust_notes = reconcile_foundation_reads(
                 board, foundation_accepted, foundation_pending,
-                foundation_max_jump, emit_trust,
+                last_cycle_found_plays + 2, emit_trust, time.monotonic(),
             )
 
             state = build_solver_state(board, stock_total=STOCK_TOTAL)
@@ -721,7 +735,18 @@ def main():
             # get a couple of quick re-reads - animations settle in about a
             # second - before proceeding best-effort so a persistent quirk
             # can't stall the loop forever.
+            # A CHANGED issue set means a new problem, not the same stable
+            # quirk - re-arm the retry budget so a fresh transient still
+            # gets its re-reads even after a permanent oddity (e.g. a
+            # stably ambiguous straddled crop) exhausted them.
+            issue_signature = tuple(issues)
+            if issues and issue_signature != previous_issue_signature:
+                consecutive_unreliable_frames = 0
+            previous_issue_signature = issue_signature
+
             stock_impossible = stock_remaining < 0 or stock_remaining > STOCK_TOTAL
+            consecutive_impossible_frames = \
+                consecutive_impossible_frames + 1 if stock_impossible else 0
             if not sim_mode and (
                 stock_impossible or (issues and consecutive_unreliable_frames < 2)
             ):
@@ -737,14 +762,27 @@ def main():
                     stock_impossible=stock_impossible,
                     consecutive=consecutive_unreliable_frames,
                 )
-                time.sleep(3.0 if stock_impossible else 1.5)
+                # Impossible stock retries indefinitely by design (executing
+                # against a hallucinated board physically backed out of the
+                # game once), but after a while it's clearly not a transient
+                # animation - a dialog or overlay needs a human - so back
+                # off to spare the device and the log.
+                if consecutive_impossible_frames > 5:
+                    print("[Warn] Board has read as impossible for "
+                          f"{consecutive_impossible_frames} consecutive reads; "
+                          "an overlay or dialog may need attention.")
+                    time.sleep(10.0)
+                else:
+                    time.sleep(3.0 if stock_impossible else 1.5)
                 continue
             if not issues:
                 # only a clean frame re-arms the retry budget - a stable
-                # board quirk (e.g. a permanently ambiguous straddled crop)
-                # gets its two re-reads once, then proceeds best-effort
-                # every cycle instead of paying the retry tax forever
+                # board quirk gets its two re-reads once, then proceeds
+                # best-effort every cycle instead of paying the retry tax
+                # forever (see the issue-signature re-arm above for new
+                # problems)
                 consecutive_unreliable_frames = 0
+            last_cycle_found_plays = 0
 
             print("[*] Formulated Solver State:")
             print(f"  Cols: {cols}")
@@ -843,6 +881,8 @@ def main():
                         sim_mode=sim_mode,
                         event_logger=log_event,
                     )
+                    if ok and move[0] in ("col_to_found", "waste_to_found"):
+                        last_cycle_found_plays += 1
                     log_event(
                         "move_result",
                         cycle=cycle_number,
@@ -952,6 +992,8 @@ def main():
                             sim_mode=sim_mode,
                             event_logger=log_event,
                         )
+                        if ok and move[0] in ("col_to_found", "waste_to_found"):
+                            last_cycle_found_plays += 1
                         log_event(
                             "move_result",
                             cycle=cycle_number,

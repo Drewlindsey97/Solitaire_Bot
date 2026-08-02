@@ -122,16 +122,29 @@ def build_solver_state(board, stock_total=24):
     # or the waste is a physical contradiction - one of the two reads is
     # garbage (e.g. an animation graphic template-matching as a high
     # foundation card while the real card sits mid-flight in a column).
+    # The foundation side loses the tie: foundation-slot misreads are the
+    # documented failure class here, a visible tableau/waste card is direct
+    # evidence, and the failure directions are asymmetric - wrongly dropping
+    # a foundation pile inflates stock (caught by the bounds check / retried
+    # by the live loop), while wrongly trusting one force-feeds the solver
+    # an illegal autoplay it will physically execute.
+    contradicted = set()
     for pile in list(cols) + [waste]:
         for card in pile:
-            if card is UNKNOWN:
+            if card == UNKNOWN:
                 continue
             rank, suit = card
             if suit in found and rank_val(rank) <= found[suit]:
                 issues.append(
                     f"({rank},{suit}) visible on the board but the {suit} "
-                    f"foundation already reads {found[suit]}; contradictory frame"
+                    f"foundation already reads {found[suit]}; dropping the "
+                    f"foundation read as the likelier garbage"
                 )
+                contradicted.add(suit)
+    for suit in contradicted:
+        slot_idx, _card = by_suit.pop(suit)
+        foundation_reads[slot_idx] = "unreliable"
+        del found[suit]
 
     # Every real card is in exactly one of: a column (revealed or face-down),
     # the waste, a foundation, or undrawn stock - so stock is the remainder.

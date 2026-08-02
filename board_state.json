@@ -3,37 +3,37 @@
     {
       "rank": "K",
       "color": "RED",
-      "score": 0.99
+      "score": 1.0
     },
     {
       "rank": "Q",
       "color": "BLACK",
-      "score": 0.97
+      "score": 0.78
     },
     {
       "rank": "J",
       "color": "RED",
-      "score": 1.0
+      "score": 0.89
     },
     {
       "rank": "10",
       "color": "BLACK",
-      "score": 1.0
+      "score": 0.8
     },
     {
       "rank": "9",
       "color": "RED",
-      "score": 1.0
+      "score": 0.74
     },
     {
       "rank": "8",
       "color": "BLACK",
-      "score": 0.98
+      "score": 1.0
     },
     {
       "rank": "7",
       "color": "RED",
-      "score": 0.99
+      "score": 1.0
     },
     {
       "rank": "6",
@@ -45,27 +45,27 @@
     {
       "rank": "K",
       "color": "BLACK",
-      "score": 0.99
+      "score": 1.0
     },
     {
       "rank": "Q",
       "color": "RED",
-      "score": 0.96
+      "score": 0.79
     },
     {
       "rank": "J",
       "color": "BLACK",
-      "score": 0.99
+      "score": 0.89
     },
     {
       "rank": "10",
       "color": "RED",
-      "score": 0.99
+      "score": 0.81
     },
     {
       "rank": "9",
       "color": "BLACK",
-      "score": 1.0
+      "score": 0.74
     },
     {
       "rank": "8",
@@ -87,22 +87,22 @@
     {
       "rank": "Q",
       "color": "RED",
-      "score": 0.96
+      "score": 0.79
     },
     {
       "rank": "J",
       "color": "BLACK",
-      "score": 1.0
+      "score": 0.89
     },
     {
       "rank": "10",
       "color": "RED",
-      "score": 1.0
+      "score": 0.81
     },
     {
       "rank": "9",
       "color": "BLACK",
-      "score": 0.99
+      "score": 0.74
     },
     {
       "rank": "8",
@@ -160,34 +160,5 @@
     }
   ],
   "col5": [],
-  "col6": [],
-  "free_cells": [
-    {
-      "rank": "7",
-      "color": "BLACK",
-      "score": 0.82
-    },
-    {
-      "rank": "5",
-      "color": "BLACK",
-      "score": 0.78
-    },
-    {
-      "rank": "6",
-      "color": "RED",
-      "score": 0.76
-    },
-    {
-      "rank": "3",
-      "color": "RED",
-      "score": 1.0
-    }
-  ],
-  "foundation": [
-    {
-      "rank": "4",
-      "color": "RED",
-      "score": 1.0
-    }
-  ]
+  "col6": []
 }
