@@ -2,6 +2,7 @@
 import time
 import sys
 import os
+import shutil
 import argparse
 from collections import deque
 from datetime import datetime
@@ -24,6 +25,9 @@ from logcat_monitor import LogcatMonitor, default_logcat_path
 from session_logger import SessionLogger, default_session_log_path
 
 import bridge
+
+# Max frames --debug-draws saves per run, so a long session can't fill the disk.
+DEBUG_DRAW_LIMIT = 40
 
 # ==============================================================================
 # 1. CARD MAPPING & SUIT RESOLVER
@@ -455,6 +459,14 @@ def main():
              "--swipe-ms / --gesture-delay.",
     )
     parser.add_argument(
+        "--debug-draws",
+        action="store_true",
+        help="When race mode chooses to draw while the board has an open "
+             "stacking target, save the exact frame the reader worked from to "
+             "logs/debug_draws/. Catches waste-card misreads (a playable card "
+             f"the reader missed) in the act. Capped at {DEBUG_DRAW_LIMIT} frames.",
+    )
+    parser.add_argument(
         "--swipe-ms",
         type=int,
         default=None,
@@ -605,6 +617,7 @@ def main():
     foundation_accepted = {}
     foundation_pending = {}
     last_cycle_found_plays = 0
+    debug_draw_count = 0
     consecutive_unreliable_frames = 0
     consecutive_impossible_frames = 0
     previous_issue_signature = None
@@ -864,6 +877,38 @@ def main():
                     state, max_moves=batch_cap, exclude=excluded_first_moves,
                 )
                 solver_seconds = time.perf_counter() - solver_started
+
+                # Debug capture: if the only thing we chose to do is draw while
+                # the board has an open place to stack a card, a playable waste
+                # card may have been misread (the "red 3 cycled over an open
+                # black 4" case). Snapshot the exact frame the reader worked
+                # from so the miss can be inspected pixel-for-pixel later. Cheap
+                # (a file copy of the frame already on disk), bounded, live-only.
+                if (args.debug_draws and not sim_mode and batch
+                        and batch[0][0] in ("draw", "redeal")):
+                    open_targets = [
+                        c[-1] for c in cols
+                        if c and c[-1] != UNKNOWN
+                    ] + (["<empty column>"] if any(not c for c in cols) else [])
+                    if open_targets and debug_draw_count < DEBUG_DRAW_LIMIT:
+                        debug_draw_count += 1
+                        dbg_dir = Path("logs/debug_draws")
+                        dbg_dir.mkdir(parents=True, exist_ok=True)
+                        dbg_path = dbg_dir / f"cycle_{cycle_number:04d}.png"
+                        try:
+                            shutil.copyfile(screenshot_file, dbg_path)
+                        except OSError as e:
+                            print(f"[Warn] debug-draw capture failed: {e}")
+                        else:
+                            print(f"[Debug] Drawing with open targets {open_targets}; "
+                                  f"saved frame -> {dbg_path}")
+                            log_event(
+                                "debug_draw_capture",
+                                cycle=cycle_number,
+                                frame=str(dbg_path),
+                                waste=waste,
+                                open_targets=open_targets,
+                            )
                 log_event(
                     "solver_finished",
                     cycle=cycle_number,
