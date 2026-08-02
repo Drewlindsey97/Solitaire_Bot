@@ -55,8 +55,10 @@ def classify_suit_color(patch):
                 spec.loader.exec_module(mod)
                 _CANONICAL_CLASSIFY = mod.classify_suit_color
                 break
-    color, _confident = _CANONICAL_CLASSIFY(patch)
-    return color
+    res = _CANONICAL_CLASSIFY(patch)
+    # normalize: the canonical classifier returns (color, confident), but a
+    # delegate chained through another legacy delegate gets a plain string
+    return res[0] if isinstance(res, tuple) else res
 
 def match_rank(patch, template_set):
     gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)

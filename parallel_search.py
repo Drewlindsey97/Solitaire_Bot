@@ -30,7 +30,7 @@ def worker_task(args):
     move, state_serialized, time_limit = args
     # Recreate state from serialized data to avoid pickling-freecell objects
     cols, waste, stock_remaining, found = state_serialized
-    first_state = apply_move(State(cols, waste, stock_remaining, 24, found), move)
+    first_state = apply_move(State(cols, waste, stock_remaining, STOCK_TOTAL, found), move)
     # convert first_state to raw lists for solve_fn
     cols_list = list(first_state.cols)
     waste_list = list(first_state.waste)

@@ -30,7 +30,7 @@ def build_state_from_image(img_path):
 def run_hybrid(img_path, mc_time=30.0, top_k=3, per_move_time=50.0, total_search_budget=180.0):
     print('Building state from', img_path)
     cols, waste, stock_remaining, found = build_state_from_image(img_path)
-    state = State(cols, waste, stock_remaining, 24, found)
+    state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
     print('State: cols=', [len(c) for c in cols], 'waste=', waste, 'found=', found)
 
     # 1) Monte Carlo ranking

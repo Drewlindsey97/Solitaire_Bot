@@ -107,7 +107,7 @@ def build_solver_state(board, stock_total=24):
             prev_idx, prev = by_suit[suit]
             issues.append(
                 f"foundation: slots {prev_idx} and {slot_idx} both read as "
-                f"{suit}; keeping the higher-scoring one"
+                f"{suit}; keeping the stronger read (earlier slot on a tie)"
             )
             if card.get("score", 0.0) <= prev.get("score", 0.0):
                 foundation_reads[slot_idx] = "unreliable"
