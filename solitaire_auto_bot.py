@@ -450,13 +450,19 @@ def main():
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Faster pacing profile: ~500ms swipes, 0.85-1.0s inter-gesture pauses, no "
-             "scan pauses, and a 0.5s --interval default. The pause floor is the game's "
-             "card-settle animation (see bridge.wait_human_delay) - pauses cut below it "
-             "made batched moves silently fail in live runs, so --fast shaves pacing "
-             "without undercutting it. If moves start silently failing anyway (repeated "
-             "'Board unchanged after attempting' warnings), drop this flag or raise "
-             "--swipe-ms / --gesture-delay.",
+        help="Aggressive swipe duration (~400ms) on top of the default no-pause "
+             "pacing, plus a 0.3s --interval default. The default profile already "
+             "removes the inter-gesture pause; --fast additionally shortens the drag "
+             "itself. Swipes much faster than ~700ms can register as flings the game "
+             "rejects, so if column moves start silently failing (repeated 'Board "
+             "unchanged after attempting' warnings) raise --swipe-ms or drop this flag.",
+    )
+    parser.add_argument(
+        "--human",
+        action="store_true",
+        help="Restore the old human-like stealth pacing (0.9-1.5s randomized pause "
+             "after every gesture, occasional longer scan pauses). Much slower; use "
+             "only when mimicking a human cadence matters more than speed.",
     )
     parser.add_argument(
         "--max-stuck-cycles",
@@ -487,9 +493,10 @@ def main():
         "--gesture-delay",
         type=float,
         default=None,
-        help="Fixed pause in seconds after each tap/swipe, overriding the profile's "
-             "range. Use to bisect the device's real card-settle floor (0.2-0.8s was "
-             "observed too short; 0.9-1.5s is known good).",
+        help="Settle pause in seconds after each tap/swipe. Default 0 (no pause). "
+             "Raise only if batched column swipes are seen snapping back before the "
+             "next gesture fires; a small value (e.g. 0.15) usually suffices since the "
+             "drag itself has already completed when this pause begins.",
     )
     parser.add_argument(
         "--solver",
@@ -536,15 +543,21 @@ def main():
     args = parser.parse_args()
 
     if args.interval is None:
-        args.interval = 0.5 if args.fast else 1.5
+        args.interval = (0.3 if args.fast else 1.0)
+    if args.human:
+        # Opt back into the slow stealth cadence: randomized pause after
+        # every gesture. Overrides the default no-pause competitive path.
+        args.interval = args.interval if args.interval is not None else 1.5
+        bridge.configure_timing(human_pacing=True)
     if args.fast:
-        bridge.configure_timing(
-            swipe_ms=500, delay_min=0.85, delay_max=1.0, scan_pause_chance=0.0,
-        )
+        # Shorten the drag itself; the pause is already zero by default.
+        bridge.configure_timing(swipe_ms=400)
     if args.swipe_ms is not None:
         bridge.configure_timing(swipe_ms=args.swipe_ms)
     if args.gesture_delay is not None:
-        bridge.configure_timing(delay_min=args.gesture_delay, delay_max=args.gesture_delay)
+        bridge.configure_timing(
+            post_tap=args.gesture_delay, post_swipe=args.gesture_delay,
+        )
 
     sim_mode = args.sim is not None
     screenshot_file = args.sim if sim_mode else "live_screen.png"

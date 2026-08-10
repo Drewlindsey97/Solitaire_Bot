@@ -26,19 +26,43 @@ HUMAN_MODE = True
 TAP_JITTER_RADIUS = 6
 SWIPE_JITTER_RADIUS = 15
 
-# Gesture pacing. Both floors are load-bearing, confirmed live: swipes much
-# faster than ~700ms don't register as drags, and inter-gesture pauses that
-# undercut the game's card-settle animation make later moves in a batch
-# silently fail (see wait_human_delay's docstring). Speed these up only via
-# configure_timing() / the bot's --fast / --swipe-ms / --gesture-delay
-# flags, and back off if moves stop landing.
+# Gesture pacing.
+#
+# Two independent knobs, previously conflated:
+#
+# 1. Swipe DURATION (SWIPE_MS_*): how long the drag itself takes. This is
+#    load-bearing - a swipe much faster than ~700ms registers as a fling,
+#    not a card drag, and the game rejects it. Lower it only with live
+#    verification (watch for "Board unchanged after attempting" warnings).
+#
+# 2. Inter-gesture PAUSE (POST_TAP_S / POST_SWIPE_S): a blind sleep AFTER
+#    the gesture's own blocking input event has already completed. This was
+#    a "human-like" affectation (0.9-1.5s), not a correctness requirement:
+#    the drag has physically finished by the time `input swipe` returns, and
+#    every cycle re-reads the real board, so a stale/interrupted move is
+#    caught by feedback rather than prevented by waiting. Competitive play
+#    keeps it at zero - the dominant per-move cost was this dead time.
+#    Foundation plays are taps to independent piles and need no settle at
+#    all; a small POST_SWIPE_S can be dialed in only if batched column
+#    swipes are seen snapping back before the next gesture (set via
+#    --gesture-delay). HUMAN_PACING restores the old randomized profile for
+#    stealth runs (see --human).
 SWIPE_MS_MIN, SWIPE_MS_MAX = 700, 900
+POST_TAP_S = 0.0
+POST_SWIPE_S = 0.0
+HUMAN_PACING = False
+# Retained for --human stealth pacing (see wait_human_delay); unused on the
+# default competitive path.
 DELAY_MIN_S, DELAY_MAX_S = 0.9, 1.5
 SCAN_PAUSE_CHANCE = 0.05
 
-def configure_timing(swipe_ms=None, delay_min=None, delay_max=None, scan_pause_chance=None):
-    """Override gesture pacing at runtime (used by the bot's --fast/--swipe-ms flags)."""
+def configure_timing(swipe_ms=None, delay_min=None, delay_max=None,
+                     scan_pause_chance=None, post_tap=None, post_swipe=None,
+                     human_pacing=None):
+    """Override gesture pacing at runtime (used by the bot's --fast /
+    --swipe-ms / --gesture-delay / --human flags)."""
     global SWIPE_MS_MIN, SWIPE_MS_MAX, DELAY_MIN_S, DELAY_MAX_S, SCAN_PAUSE_CHANCE
+    global POST_TAP_S, POST_SWIPE_S, HUMAN_PACING
     if swipe_ms is not None:
         # keep the human-mode randomness as a ~±12% spread around the request
         spread = max(1, swipe_ms // 8)
@@ -49,6 +73,12 @@ def configure_timing(swipe_ms=None, delay_min=None, delay_max=None, scan_pause_c
         DELAY_MAX_S = delay_max
     if scan_pause_chance is not None:
         SCAN_PAUSE_CHANCE = scan_pause_chance
+    if post_tap is not None:
+        POST_TAP_S = post_tap
+    if post_swipe is not None:
+        POST_SWIPE_S = post_swipe
+    if human_pacing is not None:
+        HUMAN_PACING = human_pacing
 
 # Detect if the runtime environment is Android (Pydroid 3, Termux, etc.)
 IS_ANDROID = os.path.exists("/system/bin/app_process") or "ANDROID_ROOT" in os.environ
@@ -222,8 +252,13 @@ def tap(x, y):
         # In Android shell, executing a short swipe on the same coordinate acts as a tap with custom duration
         run_cmd(["shell", "input", "swipe", str(target_x), str(target_y), str(target_x), str(target_y), str(hold_duration_ms)])
 
-    if HUMAN_MODE:
+    # No blind pause on the competitive path: a foundation tap flies to an
+    # independent pile and the next cycle re-reads the real board. The old
+    # 0.9-1.5s human pause was dead time (HUMAN_PACING restores it).
+    if HUMAN_PACING:
         wait_human_delay()
+    elif POST_TAP_S > 0:
+        time.sleep(POST_TAP_S)
 
 
 def swipe(x1, y1, x2, y2):
@@ -253,8 +288,13 @@ def swipe(x1, y1, x2, y2):
         print(f"Swipe from ({jx1}, {jy1}) to ({jx2}, {jy2}) via shell ({RUN_MODE}) over {duration_ms}ms")
         run_cmd(["shell", "input", "swipe", str(jx1), str(jy1), str(jx2), str(jy2), str(duration_ms)])
 
-    if HUMAN_MODE:
+    # The drag has physically completed by the time input swipe returns.
+    # Competitive default adds no settle; dial POST_SWIPE_S up (--gesture-delay)
+    # only if batched column swipes are seen snapping back mid-animation.
+    if HUMAN_PACING:
         wait_human_delay()
+    elif POST_SWIPE_S > 0:
+        time.sleep(POST_SWIPE_S)
 
 
 def screenshot():
