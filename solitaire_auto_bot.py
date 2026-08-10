@@ -634,7 +634,11 @@ def main():
     # Track the best board progress seen (cards founded + cards revealed) and
     # stop after a stretch long enough to have cycled the whole stock with no
     # gain. 0 disables it (via --max-stuck-cycles).
-    best_progress = -1
+    # Baseline must start below any real frame's value: progress is
+    # founded*100 - face_down, which is negative for the whole early game
+    # (a fresh deal reads -21), so a -1 baseline would out-rank every frame
+    # until the first banked card and count genuine reveals as "stuck".
+    best_progress = float("-inf")
     cycles_without_progress = 0
     previous_issue_signature = None
 

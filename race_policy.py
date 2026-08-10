@@ -47,6 +47,13 @@ LOOKAHEAD_DEPTH = 3
 GAIN_FOUNDATION = 100
 GAIN_REVEAL = 40
 GAIN_EMPTY = 20
+# Small per-ply cost so a gain reached sooner beats the same gain reached
+# later. Without it, a lateral shuffle that merely *preserves* a reachable
+# gain ties the move that actually advances toward it, and the tie breaks
+# on move-generation order - observed as the bot ping-ponging one card
+# between two symmetric landing columns forever while the payoff line
+# (e.g. "unstack the 10, then the Queen reveals") never got played.
+GAIN_STEP = 1
 
 
 def _col_reveals(col, run_length):
@@ -163,7 +170,11 @@ def _reachable_gain(state, depth, seen):
         if k in seen:
             continue
         seen.add(k)
-        val = _move_gain(state, m) + _reachable_gain(ns, depth - 1, seen)
+        # GAIN_STEP charges each ply, so equal raw gains rank by how soon
+        # they arrive (see the constant's comment). The floor of 0 ("stop
+        # here") keeps gainless tails from dragging a real gain negative.
+        val = (_move_gain(state, m) - GAIN_STEP
+               + _reachable_gain(ns, depth - 1, seen))
         seen.discard(k)
         if val > best:
             best = val
@@ -238,20 +249,25 @@ def plan_batch(state, max_moves=8, exclude=None):
         move = choose_move(sim, exclude=exclude if not batch else None)
         if move is None:
             break
-        batch.append(move)
         if move[0] in ("draw", "redeal"):
+            batch.append(move)
             break
         reveals = (
             move[0] == "col_to_col" and _col_reveals(sim.cols[move[1]], move[4])
             or move[0] == "col_to_found" and _col_reveals(sim.cols[move[1]], 1)
         )
-        sim = apply_move(sim, move)
-        if reveals:
-            break
+        nxt = apply_move(sim, move)
         # Defensive: never let the local simulation loop even if scoring
-        # somehow permits a cycle.
-        k = sim.key()
+        # somehow permits a cycle. Checked BEFORE committing the move to the
+        # batch - a move that walks the board back to a state this batch
+        # already visited provably undoes progress, so it must not be
+        # physically executed as the batch's parting shot.
+        k = nxt.key()
         if k in seen:
             break
         seen.add(k)
+        batch.append(move)
+        sim = nxt
+        if reveals:
+            break
     return batch
