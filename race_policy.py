@@ -134,19 +134,30 @@ def score_move(state, move):
     return 0
 
 
-def _move_gain(state, move):
-    """Progress a single move makes, for lookahead accounting (0 = none)."""
+def _move_gain(state, move, after):
+    """Progress a single move makes, for lookahead accounting (0 = none).
+
+    `after` is the already-simulated result of applying `move` to `state`:
+    the caller has it in hand anyway, so empty-column gain is a direct
+    count comparison instead of a second apply_move per search node.
+    Mirrors score_move's ladder (found > reveal > empty), including the
+    empty-column credit when founding a column's last card.
+    """
     kind = move[0]
     if kind in ("col_to_found", "waste_to_found"):
         g = GAIN_FOUNDATION
-        if kind == "col_to_found" and _col_reveals(state.cols[move[1]], 1):
-            g += GAIN_REVEAL
+        if kind == "col_to_found":
+            col = state.cols[move[1]]
+            if _col_reveals(col, 1):
+                g += GAIN_REVEAL
+            elif _empties_column(col, 1):
+                g += GAIN_EMPTY
         return g
     if kind == "col_to_col":
         _, ci, cj, card, run_length = move
         if _col_reveals(state.cols[ci], run_length):
             return GAIN_REVEAL
-        if _gains_empty_column(state, move):
+        if _empty_count(after) > _empty_count(state):
             return GAIN_EMPTY
     return 0
 
@@ -173,7 +184,7 @@ def _reachable_gain(state, depth, seen):
         # GAIN_STEP charges each ply, so equal raw gains rank by how soon
         # they arrive (see the constant's comment). The floor of 0 ("stop
         # here") keeps gainless tails from dragging a real gain negative.
-        val = (_move_gain(state, m) - GAIN_STEP
+        val = (_move_gain(state, m, ns) - GAIN_STEP
                + _reachable_gain(ns, depth - 1, seen))
         seen.discard(k)
         if val > best:
