@@ -631,14 +631,16 @@ def main():
     consecutive_impossible_frames = 0
     # No-progress stop: this game's round doesn't auto-end (observed running
     # 7+ min), so a stuck endgame otherwise spins forever redealing the stock.
-    # Track the best board progress seen (cards founded + cards revealed) and
-    # stop after a stretch long enough to have cycled the whole stock with no
+    # Track the best confirmed board progress seen (see the stall check in
+    # the loop for the metric and the two-frame confirmation rule) and stop
+    # after a stretch long enough to have cycled the whole stock with no
     # gain. 0 disables it (via --max-stuck-cycles).
-    # Baseline must start below any real frame's value: progress is
-    # founded*100 - face_down, which is negative for the whole early game
-    # (a fresh deal reads -21), so a -1 baseline would out-rank every frame
-    # until the first banked card and count genuine reveals as "stuck".
+    # Baseline must start below any real frame's value: the metric is
+    # negative for the whole early game (a fresh deal reads about -21+28),
+    # so a fixed low guess would risk out-ranking real frames and counting
+    # genuine progress as "stuck" - the first confirmed frame sets it.
     best_progress = float("-inf")
+    prev_progress = None
     cycles_without_progress = 0
     previous_issue_signature = None
 
@@ -823,17 +825,30 @@ def main():
                 consecutive_unreliable_frames = 0
             last_cycle_found_plays = 0
 
-            # No-progress stop condition. Progress = cards banked plus cards
-            # revealed (columns get shorter / fewer face-down as the game
-            # opens up); either going up resets the stall counter. A reliable
-            # frame that improves neither, repeated past the limit, means the
-            # bot is cycling the stock with nothing left to do - stop rather
-            # than spin until (or past) the clock.
-            founded_count = sum(v + 1 for v in found.values()) if found else 0
+            # No-progress stop condition. The metric counts exactly what is
+            # monotone in a real game: cards banked (x100), cards permanently
+            # out of the stock/waste cycle (tableau card count - a
+            # waste->column play banks and reveals nothing, but it is real
+            # progress: the card never returns to the cycle and the draw
+            # offset shifts so later passes reach new cards), and face-down
+            # cards revealed. Null tableau shuffles and bare draws/redeals
+            # move none of these terms, so a stretch past the limit with no
+            # term improving means the bot is cycling the stock with nothing
+            # left to do - stop rather than spin until (or past) the clock.
+            # An improvement only counts once it holds for two consecutive
+            # frames (min of the last two reads): the documented CV failure
+            # class is a single mid-animation frame reading too high (short
+            # column, inflated foundation), and a one-frame spike must not
+            # permanently raise a bar that genuine progress then can't clear.
+            founded_count = sum(v + 1 for v in found.values())
             face_down = sum(1 for c in cols for card in c if card == UNKNOWN)
-            progress = founded_count * 100 - face_down
-            if progress > best_progress:
-                best_progress = progress
+            tableau_cards = sum(len(c) for c in cols)
+            progress = founded_count * 100 + tableau_cards - face_down
+            confirmed = (progress if prev_progress is None
+                         else min(progress, prev_progress))
+            prev_progress = progress
+            if confirmed > best_progress:
+                best_progress = confirmed
                 cycles_without_progress = 0
             else:
                 cycles_without_progress += 1
@@ -847,6 +862,8 @@ def main():
                     cycle=cycle_number,
                     founded=founded_count,
                     cycles_without_progress=cycles_without_progress,
+                    progress=progress,
+                    best_progress=best_progress,
                 )
                 break
 
