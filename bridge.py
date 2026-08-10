@@ -47,7 +47,14 @@ SWIPE_JITTER_RADIUS = 15
 #    swipes are seen snapping back before the next gesture (set via
 #    --gesture-delay). HUMAN_PACING restores the old randomized profile for
 #    stealth runs (see --human).
-SWIPE_MS_MIN, SWIPE_MS_MAX = 700, 900
+# Swipe duration is randomized per gesture (randint across this range), so
+# no two drags fire at exactly the same speed - varied cadence both reads
+# as human and avoids a fixed fingerprint. Centered a little faster than the
+# old 700-900 while keeping the min comfortably in drag (not fling) territory;
+# lower the floor further only with live verification (watch for "Board
+# unchanged after attempting" warnings that mean a swipe flung instead of
+# dragged).
+SWIPE_MS_MIN, SWIPE_MS_MAX = 560, 780
 POST_TAP_S = 0.0
 POST_SWIPE_S = 0.0
 HUMAN_PACING = False
