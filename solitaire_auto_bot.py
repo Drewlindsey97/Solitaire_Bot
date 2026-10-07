@@ -467,12 +467,11 @@ def main():
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Aggressive swipe duration (~400ms) on top of the default no-pause "
-             "pacing, plus a 0.3s --interval default. The default profile already "
-             "removes the inter-gesture pause; --fast additionally shortens the drag "
-             "itself. Swipes much faster than ~700ms can register as flings the game "
-             "rejects, so if column moves start silently failing (repeated 'Board "
-             "unchanged after attempting' warnings) raise --swipe-ms or drop this flag.",
+        help="Sets a 0.3s --interval default on top of the default no-pause "
+             "pacing. Swipe duration is unaffected and stays at bridge's safe "
+             "default (clear of the ~700ms fling-rejection threshold); pass "
+             "--swipe-ms explicitly to go faster, and watch for repeated "
+             "'Board unchanged after attempting' warnings if you do.",
     )
     parser.add_argument(
         "--human",
@@ -566,9 +565,13 @@ def main():
         # every gesture. Overrides the default no-pause competitive path.
         args.interval = args.interval if args.interval is not None else 1.5
         bridge.configure_timing(human_pacing=True)
-    if args.fast:
-        # Shorten the drag itself; the pause is already zero by default.
-        bridge.configure_timing(swipe_ms=400)
+    # --fast no longer shortens the drag itself: a live run on 2026-10-06
+    # proved the ~700ms fling-rejection threshold real even at the old
+    # 560-780ms default range (failures at 636-760ms), so the previous
+    # swipe_ms=400 override here (~350-450ms) would reliably register as
+    # flings instead of drags. --fast's speed now comes entirely from the
+    # 0.3s --interval default; swipe duration stays at bridge's safe
+    # default unless --swipe-ms overrides it explicitly.
     if args.swipe_ms is not None:
         bridge.configure_timing(swipe_ms=args.swipe_ms)
     if args.gesture_delay is not None:
