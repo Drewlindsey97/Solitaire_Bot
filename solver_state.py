@@ -13,7 +13,7 @@ color evidence is mixed, and those cards must become truncation points, not
 solver cards.
 """
 
-from freecell_solver import rank_val, UNKNOWN
+from freecell_solver import rank_val, UNKNOWN, RANK_ORDER
 
 VALID_SUITS = ("S", "H", "D", "C")
 
@@ -27,7 +27,7 @@ def card_is_resolved(card):
     untrusted, not implicitly perfect.
     """
     return (
-        card.get("rank") not in (None, "?")
+        card.get("rank") in RANK_ORDER
         and card.get("suit") in VALID_SUITS
         and card.get("score", 0.0) > 0.0
     )
@@ -81,6 +81,9 @@ def build_solver_state(board, stock_total=24):
 
     waste = []
     for card in board.get("waste", []):
+        if card and card.get("covered"):
+            waste.append(UNKNOWN)
+            continue
         if card and card_is_resolved(card):
             waste.append((card["rank"], card["suit"]))
         else:
@@ -94,10 +97,10 @@ def build_solver_state(board, stock_total=24):
     foundation_reads = []
     by_suit = {}
     for slot_idx, card in enumerate(board.get("foundation", [])):
-        if not card or "suit" not in card:
+        if not card:
             foundation_reads.append(None)
             continue
-        if not card.get("reliable", card_is_resolved(card)):
+        if not card_is_resolved(card) or not card.get("reliable", True):
             foundation_reads.append("unreliable")
             issues.append(f"foundation slot {slot_idx}: untrusted read {card!r}")
             continue

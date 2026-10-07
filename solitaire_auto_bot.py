@@ -7,8 +7,10 @@ import argparse
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+import cv2
+import numpy as np
 from board_reader_lib import (
-    read_board, TABLEAU_X, TABLEAU_Y_TOP, COL_WIDTH,
+    read_board, read_board_image, gameplay_screen_reason, TABLEAU_X, TABLEAU_Y_TOP, COL_WIDTH,
     FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
     HIDDEN_CARD_H, STEP, STOCK_TOTAL, STOCK_TAP_X, STOCK_TAP_Y,
 )
@@ -332,7 +334,7 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
 FOUNDATION_CONFIRM_SECONDS = 5.0
 
 
-def reconcile_foundation_reads(board, accepted, pending, max_jump, emit, now):
+def reconcile_foundation_reads(board, accepted, pending, max_jump, emit, now, expected_cards=()):
     """Validate this frame's foundation reads against foundation physics.
 
     Score thresholds alone cannot separate animation garbage from genuine
@@ -373,8 +375,7 @@ def reconcile_foundation_reads(board, accepted, pending, max_jump, emit, now):
 
         read_key = (card["suit"], rank_val(card["rank"])) if card else None
         if i not in accepted:
-            accepted[i] = dict(card) if card else None
-            continue
+            accepted[i] = None
 
         prev = accepted[i]
         prev_rv = rank_val(prev["rank"]) if prev else -1
@@ -384,6 +385,22 @@ def reconcile_foundation_reads(board, accepted, pending, max_jump, emit, now):
             suit, rv = read_key
             same_suit = prev is None or prev["suit"] == suit
             compatible = same_suit and 0 <= rv - prev_rv <= max_jump
+
+        corroborated = card is not None and (card["rank"], card["suit"]) in expected_cards
+        if compatible and prev is None and card is not None and not corroborated:
+            entry = pending.get(i)
+            if not entry or entry[0] != read_key:
+                pending[i] = [read_key, now]
+                slots[i] = None
+                notes.append(f"foundation slot {i}: confirming new pile {read_key}")
+                emit("foundation_baseline_pending", slot=i, value=read_key)
+                continue
+            # Two distinct captures, with a minimum interval, establish a
+            # new suit instead of locking in a single landing-animation read.
+            if now - entry[1] < .15:
+                slots[i] = None
+                notes.append(f"foundation slot {i}: confirming new pile {read_key}")
+                continue
 
         if compatible:
             accepted[i] = dict(card) if card else None
@@ -639,6 +656,7 @@ def main():
     foundation_accepted = {}
     foundation_pending = {}
     last_cycle_found_plays = 0
+    last_cycle_found_cards = []
     debug_draw_count = 0
     consecutive_unreliable_frames = 0
     consecutive_impossible_frames = 0
@@ -656,6 +674,7 @@ def main():
     prev_progress = None
     cycles_without_progress = 0
     previous_issue_signature = None
+    nongameplay_frames = 0
 
     try:
         if logcat_monitor is not None:
@@ -697,7 +716,8 @@ def main():
                 capture_seconds = time.perf_counter() - capture_started
 
                 if img:
-                    img.save(screenshot_file)
+                    # PNG compression level changes file size, not pixels.
+                    img.save(screenshot_file, compress_level=1)
                     print(f"[*] Screen saved to {screenshot_file}")
                     log_event(
                         "screenshot_captured",
@@ -715,10 +735,26 @@ def main():
                     time.sleep(3.0)
                     continue
 
+            if not sim_mode:
+                frame_bgr = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+                reason = gameplay_screen_reason(frame_bgr)
+                if reason:
+                    nongameplay_frames += 1
+                    log_event("nongameplay_screen", cycle=cycle_number, reason=reason,
+                              consecutive=nongameplay_frames)
+                    if nongameplay_frames >= 3:
+                        print(f"[*] Stopping: {reason}. No further game inputs sent.")
+                        log_event("session_screen_stop", reason=reason)
+                        break
+                    time.sleep(.15)
+                    continue
+                nongameplay_frames = 0
+
             print("[*] Analyzing board state...")
             board_started = time.perf_counter()
             try:
-                board = read_board(screenshot_file)
+                board = (read_board(screenshot_file) if sim_mode else
+                         read_board_image(frame_bgr))
             except Exception as exc:
                 board_seconds = time.perf_counter() - board_started
                 print(f"[Error] Failed to read board: {exc}")
@@ -762,6 +798,7 @@ def main():
             trust_notes = reconcile_foundation_reads(
                 board, foundation_accepted, foundation_pending,
                 last_cycle_found_plays + 2, emit_trust, time.monotonic(),
+                expected_cards=last_cycle_found_cards,
             )
 
             state = build_solver_state(board, stock_total=STOCK_TOTAL)
@@ -827,7 +864,7 @@ def main():
                           "an overlay or dialog may need attention.")
                     time.sleep(10.0)
                 else:
-                    time.sleep(3.0 if stock_impossible else 1.5)
+                    time.sleep(0.3 if stock_impossible else 0.15)
                 continue
             if not issues:
                 # only a clean frame re-arms the retry budget - a stable
@@ -837,6 +874,7 @@ def main():
                 # problems)
                 consecutive_unreliable_frames = 0
             last_cycle_found_plays = 0
+            last_cycle_found_cards = []
 
             # No-progress stop condition. The metric counts exactly what is
             # monotone in a real game: cards banked (x100), cards permanently
@@ -907,7 +945,8 @@ def main():
                 tuple(tuple(c) for c in cols), tuple(waste),
                 tuple(sorted(found.items())), stock_remaining,
             )
-            if (args.solver == "search" and previous_first_move is not None
+            if ((args.solver == "search" or (args.solver == "race" and track_move_failures))
+                    and previous_first_move is not None
                     and current_solver_signature == previous_solver_signature):
                 print(f"[Warn] Board unchanged after attempting {previous_first_move}; "
                       f"excluding it and re-solving.")
@@ -950,9 +989,14 @@ def main():
                 solver_started = time.perf_counter()
                 state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
                 batch_cap = args.moves_per_cycle if args.moves_per_cycle > 0 else 8
+                excluded_first_moves.update(
+                    move for signature, move in permanently_excluded_by_state
+                    if signature == current_solver_signature
+                )
                 batch = race_policy.plan_batch(
                     state, max_moves=batch_cap, exclude=excluded_first_moves,
                 )
+                track_move_failures = len(batch) == 1
                 solver_seconds = time.perf_counter() - solver_started
 
                 # Debug capture: if the only thing we chose to do is draw while
@@ -1004,6 +1048,7 @@ def main():
                         )
                         if ok and move[0] in ("col_to_found", "waste_to_found"):
                             last_cycle_found_plays += 1
+                            last_cycle_found_cards.append(move[2] if move[0] == "col_to_found" else move[1])
                         log_event(
                             "move_result", cycle=cycle_number, batch_index=idx,
                             move=move, success=ok,
@@ -1054,6 +1099,7 @@ def main():
                     )
                     if ok and move[0] in ("col_to_found", "waste_to_found"):
                         last_cycle_found_plays += 1
+                        last_cycle_found_cards.append(move[2] if move[0] == "col_to_found" else move[1])
                     log_event(
                         "move_result",
                         cycle=cycle_number,
@@ -1165,6 +1211,7 @@ def main():
                         )
                         if ok and move[0] in ("col_to_found", "waste_to_found"):
                             last_cycle_found_plays += 1
+                            last_cycle_found_cards.append(move[2] if move[0] == "col_to_found" else move[1])
                         log_event(
                             "move_result",
                             cycle=cycle_number,

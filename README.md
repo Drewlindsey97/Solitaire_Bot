@@ -1,21 +1,25 @@
 # Solitaire Stash Automation Bot
 
-This bot integrates a computer vision board reader, a FreeCell-style solver, and a human-like automation bridge to play and solve "Solitaire Stash" (7 tableau columns, 4 free cells/stash slots, and foundation piles) directly on an Android device or emulator.
+This bot integrates a computer vision board reader, Klondike move planning, and an automation bridge to play "Solitaire Stash" directly on an Android device or emulator. The current model uses 7 tableau columns, 4 foundation piles, a draw-3 stock, and a waste pile. There are no free cells; only Kings can move to empty columns.
 
 ## Features
 - **Computer Vision Card Reader**: Uses OpenCV template matching to read cards from screenshots.
-- **State Solver**: Uses best-first search and heuristics to compute card-clearing paths.
-- **Human Gesture Emulation**: Taps and swipes incorporate Gaussian coordinate jittering, randomized hold durations, and dynamic pauses to simulate a human user.
+- **Move Planning**: Supports best-first search, Monte Carlo rollouts, and a fast race policy. Hidden cards stay unknown until a fresh screenshot reveals them; planned paths are not a guarantee of a full solve.
+- **Gesture Timing**: Taps and swipes incorporate coordinate jitter and randomized swipe durations. Inter-gesture pauses default to zero; `--human` enables randomized pacing.
 - **Multiple Execution Backends**: Supports PC-to-Android ADB, rooted on-device execution (Pydroid 3 / Termux), wireless local debugging (LADB), and Tasker/AutoInput intent relays.
 - **Simulation Mode**: Includes a dry-run feature (`--sim`) to test the pipeline on static mock images without requiring a connected device.
 
 ---
 
 ## File Structure
-- [solitaire_auto_bot.py](file:///Users/mastercontrol/.gemini/antigravity/scratch/Solitaire_Bot/solitaire_auto_bot.py): Main bot automation script (main loop, coordinate mapper, suit mapping, gesture execution).
-- [bridge.py](file:///Users/mastercontrol/.gemini/antigravity/scratch/Solitaire_Bot/bridge.py): Multi-mode automation bridge (handles direct shell inputs, Tasker intents, and human click dynamics).
-- [board_reader_lib.py](file:///Users/mastercontrol/.gemini/antigravity/scratch/Solitaire_Bot/board_reader_lib.py): CV board state parser.
-- [freecell_solver.py](file:///Users/mastercontrol/.gemini/antigravity/scratch/Solitaire_Bot/freecell_solver.py): Card-clearing algorithm engine.
+- [solitaire_auto_bot.py](solitaire_auto_bot.py): Main bot loop and gesture mapping.
+- [bridge.py](bridge.py): Device commands, screenshot capture, and gesture timing.
+- [board_reader_lib.py](board_reader_lib.py): CV board parser and fixed screen coordinates.
+- [solver_state.py](solver_state.py): Shared conversion and validation of card reads.
+- [freecell_solver.py](freecell_solver.py): Current Klondike search engine (historical filename).
+- [race_policy.py](race_policy.py) and [monte_carlo_solver.py](monte_carlo_solver.py): Alternative move policies.
+
+The `pipeline/`, `*_WORKING.py`, and `archive/` files include older experiments. Start with the main script above. The reader uses fixed coordinates and image templates; a different screen layout needs calibration.
 
 ---
 
@@ -24,14 +28,16 @@ This bot integrates a computer vision board reader, a FreeCell-style solver, and
 1. **Python Dependencies**:
    Install OpenCV, NumPy, Pillow, and Requests:
    ```bash
-   pip3 install opencv-python numpy pillow requests
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python -m pip install -r requirements-dev.txt
    ```
 
 2. **Android Setup**:
    Ensure your Android device has **USB Debugging** enabled and is connected via ADB.
 
 3. **Running Modes**:
-   By default, `bridge.py` auto-detects if it is running on a PC (defaults to `HTTP_BRIDGE` or `PC_ADB`) or locally on Android inside Pydroid 3 (defaults to `LOCAL_ROOT` or `LOCAL_LADB`). You can configure the `RUN_MODE` at the top of `bridge.py`.
+   `bridge.py` selects `PC_ADB` on desktop and `LOCAL_ROOT` or `LOCAL_LADB` on Android. The detection block sets `RUN_MODE` during import, overriding the initial value at the top of the file. `LOCAL_LADB` expects an existing ADB connection at `localhost:5555`.
 
 ---
 
@@ -54,6 +60,34 @@ To run the bot live on a connected device:
 python3 solitaire_auto_bot.py
 ```
 This will loop continuously: capture screen -> analyze state -> compute moves -> execute gesture -> wait for UI update.
+
+For initial device verification, use `--moves-per-cycle 1` to read the board after each move. The default batches up to 5 moves using a predicted layout between screenshots.
+
+Race mode can batch known tableau moves while refreshing immediately after a
+waste-card move, a draw/redeal, or a hidden-card reveal. This avoids drawing
+past the newly exposed waste card based on a partly covered read. For a live
+run with short pauses and the existing drag timing:
+
+```bash
+python3 solitaire_auto_bot.py --solver race --moves-per-cycle 5 --interval 0.3 --logcat
+```
+
+Live screenshots use validated raw ADB capture (with PNG fallback) and are
+passed directly to the calibrated reader. Saved diagnostics use lossless PNG
+compression level 1. Waste detections within 20 pixels are merged; covered
+cards remain unknown until exposed. These changes preserve move scoring and
+swipe duration. Capture latency still varies with USB and phone load. New foundation suits are
+confirmed from the card just played, or from a second consistent capture when
+that evidence is unavailable. Ambiguous reads retry after a short pause;
+established foundation history is retained through obscured frames. The bot
+stops after three captures showing a covered gameplay area or an unsupported
+resolution, including the score panel, and never submits the score itself.
+
+Run the maintained tests from the project root:
+
+```bash
+python -m pytest tests test_logging.py -q
+```
 
 ---
 

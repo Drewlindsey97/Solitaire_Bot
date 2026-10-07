@@ -249,7 +249,13 @@ def detect_waste_slots(img):
             i = j
         else:
             i += 1
-    return slots
+    # Multiple adjacent peaks can describe the same printed rank. Real
+    # fan corners are ~42px apart; merge only peaks within 20px.
+    unique = []
+    for slot in sorted(slots, key=lambda slot: slot[2], reverse=True):
+        if all(abs(slot[0] - kept[0]) >= 20 for kept in unique):
+            unique.append(slot)
+    return sorted(unique, key=lambda slot: slot[0])
 
 def detect_column_height(img, x):
     """Detect how tall the card stack in this column currently is, using
@@ -295,11 +301,27 @@ def detect_column_height(img, x):
     reliable = residual <= TOP_RESIDUAL_TOLERANCE
     return max_y, hidden_count, reliable  # bottom pixel of the revealed region
 
+def gameplay_screen_reason(img):
+    """Check the calibrated felt gap, which menus/results panels cover."""
+    if img is None or img.shape[:2] != (1600, 720):
+        return "screen dimensions do not match the calibrated 720x1600 layout"
+    gap = img[440:495, 10:710]
+    hsv = cv2.cvtColor(gap, cv2.COLOR_BGR2HSV)
+    felt = ((hsv[..., 0] >= 35) & (hsv[..., 0] <= 95)
+            & (hsv[..., 1] >= 70) & (hsv[..., 2] >= 65))
+    if float(felt.mean()) < .65:
+        return "gameplay is covered by a dialog, results screen, or menu"
+    return None
+
 def read_board(frame_path):
     img = cv2.imread(frame_path)
     if img is None:
         raise FileNotFoundError(frame_path)
 
+    return read_board_image(img)
+
+def read_board_image(img):
+    """Read the same BGR pixels directly, without a PNG decode round trip."""
     board = {}
     for col_idx, x in enumerate(TABLEAU_X):
         height, hidden_count, reliable = detect_column_height(img, x)
@@ -355,6 +377,12 @@ def read_board(frame_path):
 
     def read_slot(x):
         patch = img[SLOT_Y:SLOT_Y+SLOT_H, x:x+SLOT_W]
+        # The empty felt slot has a printed A and border, which can match
+        # a rank template despite containing no card. Require a white face.
+        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        white_face = (hsv[..., 1] < 80) & (hsv[..., 2] > 200)
+        if float(white_face.mean()) < .25:
+            return None
         gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
         if gray.std() < 15:
             return None
@@ -387,6 +415,10 @@ def read_board(frame_path):
         # keep the source x so callers can find the current playable
         # (frontmost = last = highest x) card's tap/swipe position
         waste.append({"rank": rank, "suit": suit, "color": color, "score": round(float(score), 2), "x": x})
+    # Covered cards cannot be played and their suit pip is occluded.
+    # Keep their slots for conservation, but never trust a guessed identity.
+    for card in waste[:-1]:
+        card["covered"] = True
     board["waste"] = waste
 
     return board

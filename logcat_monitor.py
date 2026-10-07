@@ -149,6 +149,8 @@ class LogcatMonitor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
         except (FileNotFoundError, OSError) as exc:

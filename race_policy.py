@@ -279,6 +279,8 @@ def plan_batch(state, max_moves=8, exclude=None):
         seen.add(k)
         batch.append(move)
         sim = nxt
-        if reveals:
+        if reveals or move[0] in ("waste_to_found", "waste_to_col"):
+            # The next waste card was partly covered; read its full face
+            # before deciding to play it or draw past it.
             break
     return batch

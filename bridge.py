@@ -4,6 +4,8 @@ import sys
 import time
 import random
 import subprocess
+import shlex
+import struct
 import requests
 
 # ==============================================================================
@@ -109,7 +111,9 @@ def run_cmd(cmd_list):
     if RUN_MODE == "PC_ADB":
         full_cmd = ["adb"] + cmd_list
     elif RUN_MODE == "LOCAL_ROOT":
-        cmd_str = " ".join(cmd_list)
+        # `shell` is an adb subcommand, not an Android executable.
+        local_args = cmd_list[1:] if cmd_list and cmd_list[0] == "shell" else cmd_list
+        cmd_str = shlex.join(local_args)
         full_cmd = ["su", "-c", cmd_str]
     elif RUN_MODE == "LOCAL_LADB":
         full_cmd = ["adb", "-s", "localhost:5555"] + cmd_list
@@ -131,6 +135,35 @@ def _adb_prefix():
     if RUN_MODE == "LOCAL_LADB":
         return ["adb", "-s", "localhost:5555"]
     return ["adb"]
+
+def decode_raw_screenshot(data):
+    """Decode Android's 12/16-byte screencap header; reject malformed frames."""
+    from PIL import Image
+    if len(data) < 12:
+        raise ValueError("truncated screencap header")
+    width, height, pixel_format = struct.unpack("<3I", data[:12])
+    formats = {1: ("RGBA", 4), 2: ("RGBX", 4), 3: ("RGB", 3)}
+    if pixel_format not in formats or not (0 < width <= 8192 and 0 < height <= 8192):
+        raise ValueError("unsupported screencap dimensions or pixel format")
+    mode, channels = formats[pixel_format]
+    offset = len(data) - width * height * channels
+    if offset not in (12, 16):
+        raise ValueError("truncated or oversized screencap pixel data")
+    return Image.frombytes(mode, (width, height), data[offset:]).convert("RGB")
+
+
+def adb_capture_raw_image():
+    """Skip on-device PNG encoding while preserving all captured pixels."""
+    try:
+        result = subprocess.run(
+            _adb_prefix() + ["exec-out", "screencap"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=15,
+        )
+        return decode_raw_screenshot(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        print(f"[Warn] Raw screenshot unavailable ({exc}); falling back to PNG.",
+              file=sys.stderr)
+        return None
 
 def adb_capture_png_bytes():
     """Grab a screenshot as PNG bytes over `adb exec-out screencap -p`, with no
@@ -317,7 +350,10 @@ def screenshot():
             print(f"[Error] Failed to fetch screenshot from HTTP bridge: {e}", file=sys.stderr)
             return None
     elif RUN_MODE in ("PC_ADB", "LOCAL_LADB"):
-        # Fast path: stream the PNG straight over exec-out - no on-device
+        raw_image = adb_capture_raw_image()
+        if raw_image is not None:
+            return raw_image
+        # Fallback: stream the PNG straight over exec-out - no on-device
         # temp file, no separate pull (~2x faster; see adb_capture_png_bytes).
         data = adb_capture_png_bytes()
         if data is None:
