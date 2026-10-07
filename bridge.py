@@ -51,12 +51,14 @@ SWIPE_JITTER_RADIUS = 15
 #    stealth runs (see --human).
 # Swipe duration is randomized per gesture (randint across this range), so
 # no two drags fire at exactly the same speed - varied cadence both reads
-# as human and avoids a fixed fingerprint. Centered a little faster than the
-# old 700-900 while keeping the min comfortably in drag (not fling) territory;
-# lower the floor further only with live verification (watch for "Board
-# unchanged after attempting" warnings that mean a swipe flung instead of
-# dragged).
-SWIPE_MS_MIN, SWIPE_MS_MAX = 560, 780
+# as human and avoids a fixed fingerprint. The 560-780 range previously used
+# here was not comfortably above the ~700ms fling threshold: a live run on
+# 2026-10-06 saw repeated "Board unchanged after attempting" failures on the
+# same move at 754ms, 760ms, and 636ms, stalling the bot via max-stuck-cycles.
+# Raised so the floor clears 700ms with margin; lower it again only with live
+# verification (watch for "Board unchanged after attempting" warnings that
+# mean a swipe flung instead of dragged).
+SWIPE_MS_MIN, SWIPE_MS_MAX = 720, 860
 POST_TAP_S = 0.0
 POST_SWIPE_S = 0.0
 HUMAN_PACING = False

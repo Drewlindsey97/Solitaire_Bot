@@ -40,3 +40,23 @@ class SolverStateTests(unittest.TestCase):
         state = build_solver_state({"col0": [card()], "foundation": [card("2")]})
         self.assertEqual(state["found"], {})
         self.assertEqual(state["foundation_reads"], ["unreliable"])
+
+    def test_tableau_sequence_break_truncates_to_unknown(self):
+        # K(H) Q(S) J(H) 10(S) 9(H) 8(S) 7(H) 6(S) 5(H) 4(S) is a legal
+        # alternating-descending run; an 8 can never legally follow a 4.
+        cards = [card("K", "H"), card("Q", "S"), card("J", "H"), card("10", "S"),
+                 card("9", "H"), card("8", "S"), card("7", "H"), card("6", "S"),
+                 card("5", "H"), card("4", "S"), card("8", "D")]
+        state = build_solver_state({"col0": cards})
+        self.assertEqual(state["cols"][0][:10], [
+            ("K", "H"), ("Q", "S"), ("J", "H"), ("10", "S"), ("9", "H"),
+            ("8", "S"), ("7", "H"), ("6", "S"), ("5", "H"), ("4", "S"),
+        ])
+        self.assertEqual(state["cols"][0][10], UNKNOWN)
+        self.assertEqual(state["truncated_columns"], [0])
+
+    def test_legal_tableau_run_is_kept_whole(self):
+        cards = [card("K", "H"), card("Q", "S"), card("J", "H")]
+        state = build_solver_state({"col0": cards})
+        self.assertEqual(state["cols"][0], [("K", "H"), ("Q", "S"), ("J", "H")])
+        self.assertEqual(state["truncated_columns"], [])

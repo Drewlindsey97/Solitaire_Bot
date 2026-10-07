@@ -16,6 +16,22 @@ solver cards.
 from freecell_solver import rank_val, UNKNOWN, RANK_ORDER
 
 VALID_SUITS = ("S", "H", "D", "C")
+RED_SUITS = ("H", "D")
+
+
+def _continues_tableau_run(upper, lower):
+    """True if `lower` can legally sit directly beneath `upper` in a
+    tableau column: alternating color, exactly one rank down. A column is
+    always a valid alternating-descending run in real Klondike, so a card
+    that fails this is reader hallucination (e.g. the row-count estimate
+    in detect_column_height overshooting into noise below the real last
+    card) - direct evidence the read is garbage, not a legal position.
+    """
+    upper_rank, upper_suit = upper
+    lower_rank, lower_suit = lower
+    upper_red = upper_suit in RED_SUITS
+    lower_red = lower_suit in RED_SUITS
+    return upper_red != lower_red and rank_val(lower_rank) == rank_val(upper_rank) - 1
 
 
 def card_is_resolved(card):
@@ -54,14 +70,36 @@ def build_solver_state(board, stock_total=24):
     for idx in range(7):
         col = []
         cards = board.get(f"col{idx}", [])
+        prev_card = None  # (rank, suit) directly above the next slot, or
+                           # None when it's unknown/hidden and can't be
+                           # checked against
         for pos, card in enumerate(cards):
             if card and card.get("rank") == "?" and card.get("color") == "?":
                 # face-down card: identity unknown but it occupies a real
                 # slot, so it must stay in the column
                 col.append(UNKNOWN)
+                prev_card = None
                 continue
             if card and card_is_resolved(card):
-                col.append((card["rank"], card["suit"]))
+                this_card = (card["rank"], card["suit"])
+                if prev_card is not None and not _continues_tableau_run(prev_card, this_card):
+                    # A real column is always alternating-descending; a card
+                    # that breaks that chain is a phantom read (e.g. the
+                    # reader overshooting past the true bottom card), not a
+                    # legal position. Same treatment as any other unresolved
+                    # read: truncate here rather than hand the solver a
+                    # card that cannot really be there.
+                    col.extend([UNKNOWN] * (len(cards) - pos))
+                    truncated_columns.append(idx)
+                    issues.append(
+                        f"col{idx}: {card['rank']}{card['suit']} at row {pos} "
+                        f"does not continue the legal alternating-descending "
+                        f"run below {prev_card[0]}{prev_card[1]}; treating it "
+                        f"and the rest of the column as unknown"
+                    )
+                    break
+                col.append(this_card)
+                prev_card = this_card
             else:
                 # Unresolved read: this card and everything under it become
                 # UNKNOWN placeholders rather than being dropped - they are
