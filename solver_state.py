@@ -13,25 +13,9 @@ color evidence is mixed, and those cards must become truncation points, not
 solver cards.
 """
 
-from freecell_solver import rank_val, UNKNOWN, RANK_ORDER
+from freecell_solver import can_stack, rank_val, UNKNOWN, RANK_ORDER
 
 VALID_SUITS = ("S", "H", "D", "C")
-RED_SUITS = ("H", "D")
-
-
-def _continues_tableau_run(upper, lower):
-    """True if `lower` can legally sit directly beneath `upper` in a
-    tableau column: alternating color, exactly one rank down. A column is
-    always a valid alternating-descending run in real Klondike, so a card
-    that fails this is reader hallucination (e.g. the row-count estimate
-    in detect_column_height overshooting into noise below the real last
-    card) - direct evidence the read is garbage, not a legal position.
-    """
-    upper_rank, upper_suit = upper
-    lower_rank, lower_suit = lower
-    upper_red = upper_suit in RED_SUITS
-    lower_red = lower_suit in RED_SUITS
-    return upper_red != lower_red and rank_val(lower_rank) == rank_val(upper_rank) - 1
 
 
 def card_is_resolved(card):
@@ -82,13 +66,14 @@ def build_solver_state(board, stock_total=24):
                 continue
             if card and card_is_resolved(card):
                 this_card = (card["rank"], card["suit"])
-                if prev_card is not None and not _continues_tableau_run(prev_card, this_card):
-                    # A real column is always alternating-descending; a card
-                    # that breaks that chain is a phantom read (e.g. the
-                    # reader overshooting past the true bottom card), not a
-                    # legal position. Same treatment as any other unresolved
-                    # read: truncate here rather than hand the solver a
-                    # card that cannot really be there.
+                if prev_card is not None and not can_stack(this_card, prev_card):
+                    # A real column is always alternating-descending (the
+                    # same rule can_stack enforces for proposed moves); a
+                    # card that breaks that chain is a phantom read (e.g.
+                    # the reader overshooting past the true bottom card),
+                    # not a legal position. Same treatment as any other
+                    # unresolved read: truncate here rather than hand the
+                    # solver a card that cannot really be there.
                     col.extend([UNKNOWN] * (len(cards) - pos))
                     truncated_columns.append(idx)
                     issues.append(

@@ -55,6 +55,13 @@ class SolverStateTests(unittest.TestCase):
         self.assertEqual(state["cols"][0][10], UNKNOWN)
         self.assertEqual(state["truncated_columns"], [0])
 
+    def test_tableau_rank_skip_truncates_despite_alternating_color(self):
+        # K(H) -> J(S) alternates color but skips Q; a rank-adjacency check
+        # weakened to "<" or "<=" instead of "==" would wrongly accept this.
+        state = build_solver_state({"col0": [card("K", "H"), card("J", "S")]})
+        self.assertEqual(state["cols"][0], [("K", "H"), UNKNOWN])
+        self.assertEqual(state["truncated_columns"], [0])
+
     def test_legal_tableau_run_is_kept_whole(self):
         cards = [card("K", "H"), card("Q", "S"), card("J", "H")]
         state = build_solver_state({"col0": cards})
