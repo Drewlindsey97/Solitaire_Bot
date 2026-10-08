@@ -37,7 +37,10 @@ def worker_task(args):
     stock_rem = first_state.stock_remaining
     stock_total = first_state.stock_total
     found_dict = first_state.found_dict()
-    path, explored, solved, status = solve_fn(cols_list, waste_list, stock_rem, stock_total, found_dict, time_limit=time_limit)
+    path, explored, solved, status = solve_fn(
+        cols_list, waste_list, stock_rem, stock_total, found_dict,
+        time_limit=time_limit, initial_stock=first_state.stock,
+    )
     return (move, solved, status, len(path) if path else 0, explored, path)
 
 

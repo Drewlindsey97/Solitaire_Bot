@@ -233,7 +233,7 @@ def choose_move(state, exclude=None, allow_null_shuffle=False,
     # clock cost, but the shuffle provably changes nothing).
     if state.stock_remaining > 0:
         return ("draw",)
-    if state.stock_total > 0:
+    if state.stock_total > 0 and state.waste:
         return ("redeal",)
     # No stock left and only dead shuffles remain: genuinely stuck.
     return None

@@ -52,8 +52,8 @@ WASTE_PEAK_THRESHOLD = 0.65
 MIN_FOUNDATION_SCORE = 0.3
 
 # Confirmed live by tapping through an entire stock cycle: 24 cards, drawn
-# 3 at a time (8 taps to exhaust), then an unlimited, deterministic redeal
-# (the same 24 cards return in the same order every cycle). The deal shape
+# 3 at a time (8 taps initially), then unlimited, deterministic redeals of
+# the remaining waste cards in their original order. The deal shape
 # is always the classic 1-7 tableau triangle (28 cards), so stock is always
 # the fixed remainder: 52 - 28 = 24.
 STOCK_TOTAL = 24

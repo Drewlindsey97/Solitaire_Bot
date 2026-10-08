@@ -63,6 +63,28 @@ This will loop continuously: capture screen -> analyze state -> compute moves ->
 
 For initial device verification, use `--moves-per-cycle 1` to read the board after each move. The default batches up to 5 moves using a predicted layout between screenshots.
 
+Race mode is now the default for the timed game. Explicit `search` and
+`monte-carlo` runs use a 0.5-second decision budget per cycle; use
+`--solver-time-limit 2` (or another positive number of seconds) for a longer
+diagnostic comparison. Search retries share that budget rather than each
+starting a new one.
+
+`--fast` lowers the capture interval to 0.3 seconds and keeps the established
+720-860 ms drag duration. It no longer silently shortens drags to 400 ms.
+Use `--swipe-ms` explicitly when calibrating a device and verify with
+`--moves-per-cycle 1` before batching. Routine live captures remain in memory;
+`--save-screenshots` or `--debug-draws` writes the diagnostic PNG.
+
+Duplicate exposed card identities are reported as parsing issues and both
+conflicting reads become unknown, preserving their physical slots. The live
+stock tracker synchronizes at an empty waste and learns exposed identities
+only after fresh captures confirm the dispatched moves. It retains the full
+waste history behind the visible fan and reuses learned draw order on redeals.
+Untrusted or contradictory captures discard history; starting in the middle
+of a stock pass leaves its unseen history unknown until an empty-waste
+boundary is observed. Redeals return only the remaining waste cards, never
+replenishing cards already moved to tableau or foundations.
+
 Race mode can batch known tableau moves while refreshing immediately after a
 waste-card move, a draw/redeal, or a hidden-card reveal. This avoids drawing
 past the newly exposed waste card based on a partly covered read. For a live
@@ -108,6 +130,19 @@ python3 solitaire_auto_bot.py \
 ```
 
 Each line in the JSONL file is a complete JSON object, making the file easy to inspect with `jq`, Python, or a spreadsheet import.
+
+Summarize one session's timing and capture-confirmed transitions:
+
+```bash
+python3 session_metrics.py logs/my_session.jsonl
+```
+
+The report separates gesture dispatches, confirmed moves, confirmed unchanged
+boards, unverified moves, and moves still awaiting a capture. Confirmation
+uses the synchronized history and recognized state; it is not a ground-truth
+OCR accuracy or a measured final game score. Unsynchronized or contradictory
+reads are unverified, not counted as successful gestures. It also reports
+median capture/OCR/planning/cycle times and observed foundation progress.
 
 Example:
 
