@@ -4,6 +4,7 @@ import sys
 import os
 import shutil
 import argparse
+import math
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from board_reader_lib import (
 from freecell_solver import State, solve, apply_move, rank_val, UNKNOWN
 import race_policy
 from solver_state import build_solver_state
+from stock_history import StockHistory
 
 from monte_carlo_solver import (
     choose_move_monte_carlo,
@@ -440,7 +442,7 @@ def count_unresolved_cards(board):
     return unresolved
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Automated Solitaire Stash Bot")
     parser.add_argument(
         "--sim",
@@ -462,17 +464,13 @@ def main():
         type=float,
         default=None,
         help="Seconds to wait after a batch of moves for the UI to settle before the next "
-             "screen capture. Default: 1.5 (0.5 with --fast).",
+             "screen capture. Default: 1.0 (0.3 with --fast).",
     )
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Aggressive swipe duration (~400ms) on top of the default no-pause "
-             "pacing, plus a 0.3s --interval default. The default profile already "
-             "removes the inter-gesture pause; --fast additionally shortens the drag "
-             "itself. Swipes much faster than ~700ms can register as flings the game "
-             "rejects, so if column moves start silently failing (repeated 'Board "
-             "unchanged after attempting' warnings) raise --swipe-ms or drop this flag.",
+        help="Use a 0.3s capture interval while preserving the reliable 720-860ms "
+             "drag duration. Set --swipe-ms explicitly for device calibration.",
     )
     parser.add_argument(
         "--human",
@@ -502,7 +500,7 @@ def main():
         "--swipe-ms",
         type=int,
         default=None,
-        help="Swipe gesture duration in milliseconds. Default: ~800 (~500 with --fast). "
+        help="Swipe gesture duration in milliseconds. Default: 720-860, including --fast. "
              "Swipes much faster than ~700ms were observed not registering as drags; "
              "500 needs on-device verification.",
     )
@@ -518,13 +516,23 @@ def main():
     parser.add_argument(
         "--solver",
         choices=["search", "monte-carlo", "race"],
-        default="search",
+        default="race",
         help="Choose the move-selection engine. 'race' is the timed-round "
              "policy: instant greedy selection (no search budget), strict "
              "foundation > reveal > empty-column priority, refuses moves that "
              "neither reveal nor found (the in-place shuffle), and plays "
              "several moves per screen read. Use it when a countdown is "
-             "running - see race_policy.py. Default: search."
+             "running - see race_policy.py. Default: race."
+    )
+    parser.add_argument(
+        "--solver-time-limit", type=float, default=0.5,
+        help="Total search/Monte Carlo decision budget per cycle, in seconds. "
+             "Default: 0.5. Race mode uses its bounded lookahead instead.",
+    )
+    parser.add_argument(
+        "--save-screenshots", action="store_true",
+        help="Save each live capture to live_screen.png for diagnostics. "
+             "--debug-draws also enables saving; ordinary live reads stay in memory.",
     )
     parser.add_argument(
         "--log-file",
@@ -557,7 +565,16 @@ def main():
         action="store_true",
         help="Clear the Android log buffer before capture starts."
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.solver_time_limit) or args.solver_time_limit <= 0:
+        parser.error("--solver-time-limit must be a finite positive number")
+    if args.swipe_ms is not None and args.swipe_ms <= 0:
+        parser.error("--swipe-ms must be positive")
+    return args
+
+
+def main():
+    args = parse_args()
 
     if args.interval is None:
         args.interval = (0.3 if args.fast else 1.0)
@@ -566,9 +583,6 @@ def main():
         # every gesture. Overrides the default no-pause competitive path.
         args.interval = args.interval if args.interval is not None else 1.5
         bridge.configure_timing(human_pacing=True)
-    if args.fast:
-        # Shorten the drag itself; the pause is already zero by default.
-        bridge.configure_timing(swipe_ms=400)
     if args.swipe_ms is not None:
         bridge.configure_timing(swipe_ms=args.swipe_ms)
     if args.gesture_delay is not None:
@@ -675,6 +689,7 @@ def main():
     cycles_without_progress = 0
     previous_issue_signature = None
     nongameplay_frames = 0
+    stock_history = StockHistory(STOCK_TOTAL)
 
     try:
         if logcat_monitor is not None:
@@ -701,6 +716,7 @@ def main():
             run_mode=bridge.RUN_MODE,
             moves_per_cycle=args.moves_per_cycle,
             interval_seconds=args.interval,
+            solver_time_limit=args.solver_time_limit,
             started_local=datetime.now().isoformat(),
         )
 
@@ -716,13 +732,14 @@ def main():
                 capture_seconds = time.perf_counter() - capture_started
 
                 if img:
-                    # PNG compression level changes file size, not pixels.
-                    img.save(screenshot_file, compress_level=1)
-                    print(f"[*] Screen saved to {screenshot_file}")
+                    if args.save_screenshots or args.debug_draws:
+                        # Read in memory; write a PNG only for diagnostics.
+                        img.save(screenshot_file, compress_level=1)
+                        print(f"[*] Screen saved to {screenshot_file}")
                     log_event(
                         "screenshot_captured",
                         cycle=cycle_number,
-                        path=screenshot_file,
+                        path=screenshot_file if (args.save_screenshots or args.debug_draws) else None,
                         duration_seconds=capture_seconds,
                     )
                 else:
@@ -802,12 +819,23 @@ def main():
             )
 
             state = build_solver_state(board, stock_total=STOCK_TOTAL)
+            state["issues"] = trust_notes + state["issues"]
+            history_notes = stock_history.observe(state)
+            for note in history_notes:
+                log_event("stock_history", cycle=cycle_number, message=note)
+            if state["previous_moves_dispatched"]:
+                log_event(
+                    "move_verification", cycle=cycle_number,
+                    dispatched=state["previous_moves_dispatched"],
+                    confirmed=state["previous_moves_confirmed"],
+                )
             cols = state["cols"]
             waste = state["waste"]
             found = state["found"]
             stock_remaining = state["stock_remaining"]
             truncated_columns = state["truncated_columns"]
-            issues = trust_notes + state["issues"]
+            issues = state["issues"]
+            stock_cards = state["stock_cards"]
             for msg in issues:
                 print(f"[Warn] {msg}")
 
@@ -932,6 +960,8 @@ def main():
                 stock_remaining=stock_remaining,
                 truncated_columns=truncated_columns,
                 issues=issues,
+                stock_history_synced=state["stock_history_synced"],
+                stock_cards=stock_cards,
             )
 
             # execute_move() only confirms a gesture was dispatched, not that
@@ -987,7 +1017,7 @@ def main():
                 # and with face-down cards the search couldn't plan past the
                 # first one anyway (it reported "exhausted" every cycle).
                 solver_started = time.perf_counter()
-                state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
+                state = State(cols, waste, stock_remaining, STOCK_TOTAL, found, stock=stock_cards)
                 batch_cap = args.moves_per_cycle if args.moves_per_cycle > 0 else 8
                 excluded_first_moves.update(
                     move for signature, move in permanently_excluded_by_state
@@ -1046,6 +1076,8 @@ def main():
                         ok = execute_move(
                             board, move, sim_mode=sim_mode, event_logger=log_event,
                         )
+                        if ok:
+                            stock_history.record_move(move)
                         if ok and move[0] in ("col_to_found", "waste_to_found"):
                             last_cycle_found_plays += 1
                             last_cycle_found_cards.append(move[2] if move[0] == "col_to_found" else move[1])
@@ -1065,8 +1097,10 @@ def main():
             elif args.solver == "monte-carlo":
                 print("[*] Running Monte Carlo move search...")
                 solver_started = time.perf_counter()
-                state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
-                move, statistics = choose_move_monte_carlo(state)
+                state = State(cols, waste, stock_remaining, STOCK_TOTAL, found, stock=stock_cards)
+                move, statistics = choose_move_monte_carlo(
+                    state, time_limit=args.solver_time_limit,
+                )
                 solver_seconds = time.perf_counter() - solver_started
                 print_statistics(statistics)
 
@@ -1097,6 +1131,8 @@ def main():
                         sim_mode=sim_mode,
                         event_logger=log_event,
                     )
+                    if ok:
+                        stock_history.record_move(move)
                     if ok and move[0] in ("col_to_found", "waste_to_found"):
                         last_cycle_found_plays += 1
                         last_cycle_found_cards.append(move[2] if move[0] == "col_to_found" else move[1])
@@ -1112,19 +1148,25 @@ def main():
             else:
                 print("[*] Searching for a path...")
                 solver_started = time.perf_counter()
+                solver_deadline = time.monotonic() + args.solver_time_limit
+                path, explored, status = [], 0, "timeout"
                 cycle_guard_excluded = set()
                 state_permanent_exclusions = {
                     move for (signature, move) in permanently_excluded_by_state
                     if signature == current_solver_signature
                 }
                 for _attempt in range(4):
+                    remaining_budget = solver_deadline - time.monotonic()
+                    if remaining_budget <= 0:
+                        break
                     path, explored, solved, status = solve(
                         cols,
                         initial_waste=waste,
                         initial_stock_remaining=stock_remaining,
                         initial_stock_total=STOCK_TOTAL,
                         initial_found=found,
-                        time_limit=5.0,
+                        time_limit=remaining_budget,
+                        initial_stock=stock_cards,
                         excluded_first_moves=(
                             excluded_first_moves | cycle_guard_excluded | state_permanent_exclusions
                         ),
@@ -1140,7 +1182,7 @@ def main():
                     # each individual move genuinely succeeds (the
                     # single-previous-cycle stuck-move check above never
                     # fires), it just never goes anywhere.
-                    start_state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
+                    start_state = State(cols, waste, stock_remaining, STOCK_TOTAL, found, stock=stock_cards)
                     next_state = apply_move(start_state, path[0])
                     next_signature = (
                         next_state.cols, next_state.waste,
@@ -1159,9 +1201,7 @@ def main():
                     # looking moves are symmetric under the heuristic (e.g.
                     # a red 6 that stacks equally well on either of two
                     # black 7s), both get excluded here, attempts run out,
-                    # and the "proceeding with the best one found anyway"
-                    # fallback below just re-executes the same oscillation
-                    # next cycle. Track repeat offenders the same way the
+                    # Track repeat offenders the same way the
                     # stuck-move guard above does, so a move caught cycling
                     # from this exact state several times gets permanently
                     # excluded from it instead of oscillating forever.
@@ -1180,9 +1220,9 @@ def main():
                             reason="cycling",
                         )
                         permanently_excluded_by_state.add(cycle_failure_key)
+                    path, solved, status = [], False, "cycle_excluded"
                 else:
-                    print("[Warn] Could not find a non-cycling move after several "
-                          "attempts; proceeding with the best one found anyway.")
+                    print("[Warn] No non-cycling move found within the decision budget.")
                 solver_seconds = time.perf_counter() - solver_started
                 log_event(
                     "solver_finished",
@@ -1209,6 +1249,8 @@ def main():
                             sim_mode=sim_mode,
                             event_logger=log_event,
                         )
+                        if ok:
+                            stock_history.record_move(move)
                         if ok and move[0] in ("col_to_found", "waste_to_found"):
                             last_cycle_found_plays += 1
                             last_cycle_found_cards.append(move[2] if move[0] == "col_to_found" else move[1])

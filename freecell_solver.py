@@ -6,20 +6,19 @@ RANK_ORDER = ["A","2","3","4","5","6","7","8","9","10","J","Q","K"]
 SUITS = ["S","H","D","C"]
 
 # Placeholder for a stock/waste card whose identity hasn't been revealed by a
-# real board read yet. A hypothetical `draw` taken during search can't know
-# what it turns up (that's real hidden information, not something a search
-# can guess), so drawn-but-unseen cards are represented with this sentinel
+# real board read yet. Draws from an unobserved stock can't know what they
+# turn up, so drawn-but-unseen cards are represented with this sentinel
 # and treated as unusable by every move check below - the search can still
 # choose to draw (to see if it *would* need to, once no other move is left),
-# it just can't act on what a hypothetical draw reveals.
+# it can act on draw identities only when supplied by confirmed history.
 UNKNOWN = ("?", "?")
 
 def rank_val(r):
     return RANK_ORDER.index(r)
 
 class State:
-    __slots__ = ("cols", "waste", "stock_remaining", "stock_total", "found")
-    def __init__(self, cols, waste, stock_remaining, stock_total, found):
+    __slots__ = ("cols", "waste", "stock_remaining", "stock_total", "found", "stock")
+    def __init__(self, cols, waste, stock_remaining, stock_total, found, stock=None):
         self.cols = tuple(tuple(c) for c in cols)
         # waste is a stack (top = last = playable), never sorted - unlike
         # free cells in the old FreeCell model, order here is structural.
@@ -27,9 +26,14 @@ class State:
         self.stock_remaining = stock_remaining
         self.stock_total = stock_total
         self.found = tuple(sorted(found.items()))
+        # Front-to-back draw order. Missing identities stay unknown; confirmed
+        # waste cards become known stock cards after a deterministic redeal.
+        self.stock = tuple(stock) if stock is not None else (UNKNOWN,) * stock_remaining
+        if len(self.stock) != stock_remaining:
+            raise ValueError("stock length must match stock_remaining")
 
     def key(self):
-        return (self.cols, self.waste, self.stock_remaining, self.found)
+        return (self.cols, self.waste, self.stock_remaining, self.found, self.stock)
 
     def found_dict(self):
         return dict(self.found)
@@ -223,23 +227,19 @@ def generate_moves(state, exclude=None):
     if exclude:
         moves = [m for m in moves if m not in exclude]
 
-    # Drawing/redealing only ever reveals an UNKNOWN placeholder to the
-    # search (see module docstring on UNKNOWN) - there's nothing a
-    # hypothetical draw can unblock that the search can act on, so it's
-    # never worth taking over a move that's already known to be usable.
-    # Offering it only once every other option is exhausted is therefore
-    # lossless (not just a branching-factor optimization): the search
-    # gains no less information by deferring a draw than by taking it
-    # early, since either way it only ever sees UNKNOWN until a real
-    # perceive-cycle reveals the true cards.
-    if not moves:
-        fallback = None
-        if state.stock_remaining > 0:
-            fallback = ("draw",)
-        elif state.stock_total > 0:
-            fallback = ("redeal",)
-        if fallback is not None and (not exclude or fallback not in exclude):
-            moves.append(fallback)
+    # Unknown draws are a last resort. Confirmed stock/waste history can
+    # make a draw useful to planning, so include that alternative too.
+    stock_move = None
+    informative = False
+    if state.stock_remaining > 0:
+        stock_move = ("draw",)
+        informative = any(card != UNKNOWN for card in state.stock[:3])
+    elif state.stock_total > 0 and waste:
+        stock_move = ("redeal",)
+        informative = any(card != UNKNOWN for card in waste)
+    if (stock_move is not None and (not moves or informative)
+            and (not exclude or stock_move not in exclude)):
+        moves.append(stock_move)
 
     return moves
 
@@ -247,6 +247,7 @@ def apply_move(state, move):
     cols = [list(c) for c in state.cols]
     waste = list(state.waste)
     stock_remaining = state.stock_remaining
+    stock = list(state.stock)
     found = state.found_dict()
 
     kind = move[0]
@@ -269,21 +270,24 @@ def apply_move(state, move):
         cols[cj].append(card)
     elif kind == "draw":
         n = min(3, stock_remaining)
-        waste.extend([UNKNOWN] * n)
+        waste.extend(stock[:n])
+        del stock[:n]
         stock_remaining -= n
     elif kind == "redeal":
-        # Confirmed live: redeals are unlimited and deterministic (the same
-        # 24 cards come back in the same order every cycle), so a redeal
-        # just resets the counters - it doesn't need to model *which*
-        # specific cards return, since they were never known to begin with.
+        # Only cards still in waste return. Resetting to the original 24
+        # creates phantom cards after waste-to-tableau/foundation plays.
+        if stock_remaining:
+            raise ValueError("cannot redeal before stock is exhausted")
+        stock = waste
+        stock_remaining = len(stock)
         waste = []
-        stock_remaining = state.stock_total
 
-    return State(cols, waste, stock_remaining, state.stock_total, found)
+    return State(cols, waste, stock_remaining, state.stock_total, found, stock=stock)
 
 def solve(initial_cols, initial_waste=None, initial_stock_remaining=0, initial_stock_total=0,
           initial_found=None, progress_every=100_000, max_seen=3_000_000, weight=12,
-          time_limit=100.0, excluded_first_moves=None, beam_width=5, transposition=True):
+          time_limit=100.0, excluded_first_moves=None, beam_width=5, transposition=True,
+          initial_stock=None):
     """
     Weighted best-first search (f = g + weight*h) that runs until the game
     is won, every reachable state has been explored with no solution found
@@ -337,7 +341,8 @@ def solve(initial_cols, initial_waste=None, initial_stock_remaining=0, initial_s
     """
     initial_waste = initial_waste or []
     initial_found = initial_found or {}
-    start = State(initial_cols, initial_waste, initial_stock_remaining, initial_stock_total, initial_found)
+    start = State(initial_cols, initial_waste, initial_stock_remaining, initial_stock_total,
+                  initial_found, stock=initial_stock)
 
     total_cards = sum(len(c) for c in initial_cols) + len(initial_waste) + initial_stock_remaining \
                   + sum(v + 1 for v in initial_found.values())
@@ -464,7 +469,7 @@ def solve(initial_cols, initial_waste=None, initial_stock_remaining=0, initial_s
 
 def solve_incrementally(initial_cols, initial_waste=None, initial_stock_remaining=0,
                          initial_stock_total=0, initial_found=None,
-                         total_budget=150.0, round_limit=20.0, **solve_kwargs):
+                         total_budget=150.0, round_limit=20.0, initial_stock=None, **solve_kwargs):
     """
     Wraps solve() in a series of short, hard-bounded rounds instead of one
     long, uncertain one. Each round gets at most `round_limit` seconds;
@@ -501,6 +506,7 @@ def solve_incrementally(initial_cols, initial_waste=None, initial_stock_remainin
     stock_remaining = initial_stock_remaining
     stock_total = initial_stock_total
     found = dict(initial_found or {})
+    stock = initial_stock
 
     all_moves = []
     total_explored = 0
@@ -514,6 +520,7 @@ def solve_incrementally(initial_cols, initial_waste=None, initial_stock_remainin
         path, explored, solved, status = solve(
             cols, waste, stock_remaining, stock_total, found,
             time_limit=min(round_limit, remaining),
+            initial_stock=stock,
             **solve_kwargs)
         total_explored += explored
 
@@ -523,7 +530,7 @@ def solve_incrementally(initial_cols, initial_waste=None, initial_stock_remainin
             # round from this same position won't produce anything new.
             return all_moves, total_explored, solved, ("solved" if solved else "stuck")
 
-        state = State(cols, waste, stock_remaining, stock_total, found)
+        state = State(cols, waste, stock_remaining, stock_total, found, stock=stock)
         for move in path:
             state = apply_move(state, move)
         all_moves.extend(path)
@@ -531,6 +538,7 @@ def solve_incrementally(initial_cols, initial_waste=None, initial_stock_remainin
         waste = list(state.waste)
         stock_remaining = state.stock_remaining
         found = state.found_dict()
+        stock = state.stock
 
         if solved:
             return all_moves, total_explored, True, "solved"

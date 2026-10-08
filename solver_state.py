@@ -187,6 +187,30 @@ def build_solver_state(board, stock_total=24):
         foundation_reads[slot_idx] = "unreliable"
         del found[suit]
 
+    # A plausible count is not enough: the deck contains each identity once.
+    # Neither duplicate read wins on score alone. Preserve their slots, but
+    # block both identities (and any tableau run depending on them).
+    locations = {}
+    for ci, pile in enumerate(cols + [waste]):
+        for row, identity in enumerate(pile):
+            if identity != UNKNOWN:
+                locations.setdefault(identity, []).append((ci, row))
+    for identity, duplicates in locations.items():
+        if len(duplicates) < 2:
+            continue
+        labels = [f"col{ci} row {row}" if ci < 7 else f"waste row {row}"
+                  for ci, row in duplicates]
+        issues.append(f"duplicate card {identity[0]}{identity[1]} at "
+                      f"{', '.join(labels)}; treating conflicting reads as unknown")
+        for ci, row in duplicates:
+            if ci < 7:
+                cols[ci][row:] = [UNKNOWN] * (len(cols[ci]) - row)
+                if ci not in truncated_columns:
+                    truncated_columns.append(ci)
+            else:
+                waste[row] = UNKNOWN
+    truncated_columns.sort()
+
     # Every real card is in exactly one of: a column (revealed or face-down),
     # the waste, a foundation, or undrawn stock - so stock is the remainder.
     # Self-correcting each cycle, but only as good as the reads above:
