@@ -249,19 +249,21 @@ def plan_batch(state, max_moves=8, exclude=None):
 
     - draw/redeal reveal physically unknown cards, so anything planned after
       one would be built on invented state
-    - a move that exposes a face-down card makes the rest of that column
-      UNKNOWN to us; it is safe to execute (it's the move we want most) but we
-      stop after it and re-read rather than plan blind.
+    - a newly exposed card remains UNKNOWN, so its column is unavailable
+      until the next read. Independent moves on known cards can continue,
+      but drawing waits until the newly exposed card has been read.
     """
     batch = []
     sim = state
     seen = {sim.key()}
+    needs_reveal_read = False
     for _ in range(max_moves):
         move = choose_move(sim, exclude=exclude if not batch else None)
         if move is None:
             break
         if move[0] in ("draw", "redeal"):
-            batch.append(move)
+            if not needs_reveal_read:
+                batch.append(move)
             break
         reveals = (
             move[0] == "col_to_col" and _col_reveals(sim.cols[move[1]], move[4])
@@ -279,7 +281,8 @@ def plan_batch(state, max_moves=8, exclude=None):
         seen.add(k)
         batch.append(move)
         sim = nxt
-        if reveals or move[0] in ("waste_to_found", "waste_to_col"):
+        needs_reveal_read = needs_reveal_read or reveals
+        if move[0] in ("waste_to_found", "waste_to_col"):
             # The next waste card was partly covered; read its full face
             # before deciding to play it or draw past it.
             break

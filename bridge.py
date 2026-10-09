@@ -77,7 +77,9 @@ def configure_timing(swipe_ms=None, delay_min=None, delay_max=None,
     if swipe_ms is not None:
         # keep the human-mode randomness as a ~±12% spread around the request
         spread = max(1, swipe_ms // 8)
-        SWIPE_MS_MIN, SWIPE_MS_MAX = swipe_ms - spread, swipe_ms + spread
+        # The game silently rejects fast swipes as flings. Keep explicit
+        # overrides (including --swipe-ms) above the live-verified threshold.
+        SWIPE_MS_MIN, SWIPE_MS_MAX = max(720, swipe_ms - spread), swipe_ms + spread
     if delay_min is not None:
         DELAY_MIN_S = delay_min
     if delay_max is not None:

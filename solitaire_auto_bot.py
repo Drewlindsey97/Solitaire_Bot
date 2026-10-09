@@ -2,7 +2,6 @@
 import time
 import sys
 import os
-import shutil
 import argparse
 from collections import deque
 from datetime import datetime
@@ -27,6 +26,7 @@ from logcat_monitor import LogcatMonitor, default_logcat_path
 from session_logger import SessionLogger, default_session_log_path
 
 import bridge
+from frame_capture import BackgroundCapture, VideoScreenrecordCapture
 
 # Max frames --debug-draws saves per run, so a long session can't fill the disk.
 DEBUG_DRAW_LIMIT = 40
@@ -281,6 +281,40 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
             )
             return False
 
+    # Validate the destination against the current board model as well. A
+    # tableau card can be read correctly at the source while the destination
+    # rank/color is misread; the move generator then proposes a legal move for
+    # the wrong board. Fail closed before swiping if the visible target cannot
+    # accept this card (or if its read is ambiguous).
+    if kind in ("col_to_col", "waste_to_col"):
+        cj = move[2] if kind == "col_to_col" else move[1]
+        destination = board.get(f"col{cj}", [])
+        target = destination[-1] if destination else None
+        card_color_value = card_color(card[1])
+        target_color = target.get("color") if target else None
+        target_rank = target.get("rank") if target else None
+        legal_drop = (
+            card[0] == "K" if target is None else
+            target_rank in ("A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K")
+            and target_color in ("RED", "BLACK")
+            and target.get("suit") in ("S", "H", "D", "C")
+            and target_color == card_color(target["suit"])
+            and card_color_value != target_color
+            and rank_val(card[0]) == rank_val(target_rank) - 1
+        )
+        if not legal_drop:
+            print(f"[Warn] Skipping move {move}: destination col{cj} top "
+                  f"({target}) does not confirm a legal tableau drop; "
+                  "will re-read next cycle.")
+            emit(
+                "move_rejected",
+                move=move,
+                reason="tableau_destination_mismatch",
+                destination_top=target,
+                expected_card=card,
+            )
+            return False
+
     if start_coords and end_coords:
         x1, y1 = start_coords
         x2, y2 = end_coords
@@ -462,17 +496,14 @@ def main():
         type=float,
         default=None,
         help="Seconds to wait after a batch of moves for the UI to settle before the next "
-             "screen capture. Default: 1.5 (0.5 with --fast).",
+             "screen capture. Default: 1.0 (0.05 with --fast). "
+             "Consecutive captures must also agree before card reading.",
     )
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Aggressive swipe duration (~400ms) on top of the default no-pause "
-             "pacing, plus a 0.3s --interval default. The default profile already "
-             "removes the inter-gesture pause; --fast additionally shortens the drag "
-             "itself. Swipes much faster than ~700ms can register as flings the game "
-             "rejects, so if column moves start silently failing (repeated 'Board "
-             "unchanged after attempting' warnings) raise --swipe-ms or drop this flag.",
+        help="Use a 0.05s capture interval and consecutive settled frames, "
+             "preserving the reliable 720-860ms drags.",
     )
     parser.add_argument(
         "--human",
@@ -502,7 +533,7 @@ def main():
         "--swipe-ms",
         type=int,
         default=None,
-        help="Swipe gesture duration in milliseconds. Default: ~800 (~500 with --fast). "
+        help="Swipe gesture duration in milliseconds. Default: 720-860, including --fast. "
              "Swipes much faster than ~700ms were observed not registering as drags; "
              "500 needs on-device verification.",
     )
@@ -525,6 +556,10 @@ def main():
              "neither reveal nor found (the in-place shuffle), and plays "
              "several moves per screen read. Use it when a countdown is "
              "running - see race_policy.py. Default: search."
+    )
+    parser.add_argument(
+        "--save-screenshots", action="store_true",
+        help="Save each accepted live frame to live_screen.png for diagnostics.",
     )
     parser.add_argument(
         "--log-file",
@@ -560,15 +595,12 @@ def main():
     args = parser.parse_args()
 
     if args.interval is None:
-        args.interval = (0.3 if args.fast else 1.0)
+        args.interval = (0.05 if args.fast else 1.0)
     if args.human:
         # Opt back into the slow stealth cadence: randomized pause after
         # every gesture. Overrides the default no-pause competitive path.
         args.interval = args.interval if args.interval is not None else 1.5
         bridge.configure_timing(human_pacing=True)
-    if args.fast:
-        # Shorten the drag itself; the pause is already zero by default.
-        bridge.configure_timing(swipe_ms=400)
     if args.swipe_ms is not None:
         bridge.configure_timing(swipe_ms=args.swipe_ms)
     if args.gesture_delay is not None:
@@ -587,7 +619,12 @@ def main():
 
     session_logger = SessionLogger(session_log_path) if session_log_path else None
 
+    last_input_finished = 0.0
+
     def log_event(event_name, **data):
+        nonlocal last_input_finished
+        if event_name == "gesture_dispatched" and not sim_mode:
+            last_input_finished = time.monotonic()
         if session_logger is not None:
             session_logger.event(event_name, **data)
 
@@ -675,8 +712,15 @@ def main():
     cycles_without_progress = 0
     previous_issue_signature = None
     nongameplay_frames = 0
+    capture_worker = None
+    frame_sequence = 0
 
     try:
+        if not sim_mode:
+            capture_source = (VideoScreenrecordCapture(bridge._adb_prefix())
+                              if bridge.RUN_MODE in ("PC_ADB", "LOCAL_LADB")
+                              else bridge.screenshot)
+            capture_worker = BackgroundCapture(capture_source).start()
         if logcat_monitor is not None:
             if logcat_monitor.start():
                 logcat_started = True
@@ -710,29 +754,38 @@ def main():
             log_event("cycle_started", cycle=cycle_number)
 
             if not sim_mode:
-                print("[*] Capturing screen...")
+                print("[*] Waiting for a fresh settled frame...")
                 capture_started = time.perf_counter()
-                img = bridge.screenshot()
+                frame = capture_worker.buffer.wait(
+                    not_before=last_input_finished, after_sequence=frame_sequence,
+                )
+                img = frame.image if frame is not None else None
                 capture_seconds = time.perf_counter() - capture_started
+                log_event("frame_settle_check", cycle=cycle_number,
+                          sequence=frame.sequence if frame else None,
+                          motion_fraction=frame.motion if frame else None,
+                          settled=img is not None,
+                          wait_seconds=capture_seconds,
+                          frame_age_seconds=time.monotonic()-frame.started if frame else None)
 
                 if img:
-                    # PNG compression level changes file size, not pixels.
-                    img.save(screenshot_file, compress_level=1)
-                    print(f"[*] Screen saved to {screenshot_file}")
+                    frame_sequence = frame.sequence
+                    if args.save_screenshots:
+                        img.save(screenshot_file, compress_level=1)
                     log_event(
                         "screenshot_captured",
                         cycle=cycle_number,
-                        path=screenshot_file,
+                        path=screenshot_file if args.save_screenshots else None,
                         duration_seconds=capture_seconds,
                     )
                 else:
-                    print("[Error] Failed to capture screenshot. Retrying in 3 seconds...")
+                    print("[Warn] Capture failed or board still moving; retrying without game inputs.")
                     log_event(
                         "screenshot_failed",
                         cycle=cycle_number,
                         duration_seconds=capture_seconds,
                     )
-                    time.sleep(3.0)
+                    time.sleep(0.15)
                     continue
 
             if not sim_mode:
@@ -1017,7 +1070,7 @@ def main():
                         dbg_dir.mkdir(parents=True, exist_ok=True)
                         dbg_path = dbg_dir / f"cycle_{cycle_number:04d}.png"
                         try:
-                            shutil.copyfile(screenshot_file, dbg_path)
+                            img.save(dbg_path, compress_level=1)
                         except OSError as e:
                             print(f"[Warn] debug-draw capture failed: {e}")
                         else:
@@ -1264,6 +1317,8 @@ def main():
         print("\n[*] Interrupted by user. Shutting down cleanly...")
         log_event("session_interrupted", cycle=cycle_number)
     finally:
+        if capture_worker is not None:
+            capture_worker.stop()
         if logcat_monitor is not None:
             logcat_monitor.stop()
             if logcat_started:

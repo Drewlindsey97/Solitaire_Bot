@@ -63,17 +63,33 @@ This will loop continuously: capture screen -> analyze state -> compute moves ->
 
 For initial device verification, use `--moves-per-cycle 1` to read the board after each move. The default batches up to 5 moves using a predicted layout between screenshots.
 
-Race mode can batch known tableau moves while refreshing immediately after a
-waste-card move, a draw/redeal, or a hidden-card reveal. This avoids drawing
-past the newly exposed waste card based on a partly covered read. For a live
-run with short pauses and the existing drag timing:
+On ADB, live capture uses a native-size 720×1600, 20 Mbps H.264 screen stream
+decoded by `ffmpeg` in a background worker during OCR, planning, and gestures.
+Only the newest decoded frame is retained. It must agree with its predecessor,
+and a 250 ms encoding/transport allowance is required after the last gesture.
+H.264 is compressed, so reader checks remain necessary. Moving, stale,
+disconnected, or already-consumed frames never reuse an older stable frame.
+Timer and score changes are excluded from comparison. `ffmpeg` must be installed
+for this ADB capture path. Other backends retain their screenshot capture.
+This reduces animation misreads but does not eliminate recognition errors
+on a stable frame. Routine captures stay in memory; `--save-screenshots`
+saves accepted frames and `--debug-draws` saves selected diagnostic frames.
+`--fast` uses a 0.05-second pause between batches, preserves the reliable
+720–860 ms drag duration, and relies on the frame check to wait for animations.
+`--interval 0` removes that fixed pause and waits only for a fresh settled frame.
+Frame sequence, age, wait time, and motion fraction are recorded in the session log.
+
+Race mode can continue independent known-card moves after a hidden-card reveal.
+The revealed card remains unknown until the next capture, and drawing waits
+for that read. A waste-card move or draw/redeal still ends the batch. For a live
+run with up to ten moves per read and shorter drags:
 
 ```bash
-python3 solitaire_auto_bot.py --solver race --moves-per-cycle 5 --interval 0.3 --logcat
+python3 solitaire_auto_bot.py --solver race --moves-per-cycle 10 --swipe-ms 650 --fast --interval 0 --logcat
 ```
 
-Live screenshots use validated raw ADB capture (with PNG fallback) and are
-passed directly to the calibrated reader. Saved diagnostics use lossless PNG
+Live frames are passed directly from the background buffer to the calibrated
+reader. Saved diagnostics use lossless PNG
 compression level 1. Waste detections within 20 pixels are merged; covered
 cards remain unknown until exposed. These changes preserve move scoring and
 swipe duration. Capture latency still varies with USB and phone load. New foundation suits are
