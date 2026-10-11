@@ -3,6 +3,7 @@ import time
 import sys
 import os
 import argparse
+import math
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -13,9 +14,10 @@ from board_reader_lib import (
     FOUNDATION_X, SLOT_Y, SLOT_W, SLOT_H,
     HIDDEN_CARD_H, STEP, STOCK_TOTAL, STOCK_TAP_X, STOCK_TAP_Y,
 )
-from freecell_solver import State, solve, apply_move, rank_val, UNKNOWN
+from freecell_solver import State, solve, apply_move, rank_val, UNKNOWN, RANK_ORDER
 import race_policy
 from solver_state import build_solver_state
+from stock_history import StockHistory
 
 from monte_carlo_solver import (
     choose_move_monte_carlo,
@@ -203,6 +205,71 @@ def apply_move_to_board(board, move):
         _, cj, card = move
         board["waste"].pop()
         board[f"col{cj}"].append({"rank": card[0], "suit": card[1], "color": card_color(card[1]), "score": 1.0})
+    elif kind == "found_to_col":
+        _, card, cj = move
+        slot_idx = find_foundation_slot(board, card[1])
+        if slot_idx is not None:
+            board["foundation"][slot_idx] = foundation_card_below(card)
+        board[f"col{cj}"].append({"rank": card[0], "suit": card[1], "color": card_color(card[1]), "score": 1.0})
+
+
+# Auto-complete endgame (race solver): with every card face up, the bot plays
+# the stock/waste out instead of docking cards. If that stalls for this many
+# cycles it docks again, well before the --max-stuck-cycles stop (15).
+ENDGAME_DOCK_AFTER_CYCLES = 8
+
+# Waste fan geometry, measured from live reads (Galaxy A21, 720x1600): the
+# three fanned slots sit at these left edges (+/- 5 px between frames).
+WASTE_FAN_X = (428, 472, 514)
+# Pause after a mid-batch stock tap so the draw animation lands before the
+# next gesture touches the waste. Far shorter than a full capture cycle.
+MID_BATCH_DRAW_SETTLE_SECONDS = 0.35
+
+
+def next_fan_count(fan_count, move, after):
+    """How many waste cards are fanned (visible) after `move`.
+
+    `after` is the solver State once the move is applied. A draw fans the
+    cards it turned up; a waste play uncovers the next fanned card; once a
+    draw's fan is used up the game shows the single card beneath it.
+    """
+    kind = move[0]
+    if kind == "draw":
+        return min(3, len(after.waste))  if after.waste else 0
+    if kind == "redeal":
+        return 0
+    if kind in ("waste_to_found", "waste_to_col"):
+        fan_count -= 1
+        if fan_count <= 0 and after.waste:
+            fan_count = 1
+        return max(0, fan_count)
+    return fan_count
+
+
+def waste_fan_from_state(after, fan_count):
+    """Board-model waste dicts for the top `fan_count` cards of after.waste.
+
+    Unknown identities stay "?" so execute_move's waste check refuses to
+    swipe a card the bot has not actually confirmed.
+    """
+    fan = list(after.waste[-fan_count:]) if fan_count else []
+    out = []
+    for i, card in enumerate(fan):
+        if card == UNKNOWN:
+            out.append({"rank": "?", "suit": "?", "color": "?", "score": 0.0, "x": WASTE_FAN_X[i]})
+        else:
+            out.append({"rank": card[0], "suit": card[1], "color": card_color(card[1]),
+                        "score": 1.0, "x": WASTE_FAN_X[i]})
+    return out
+
+
+def foundation_card_below(card):
+    """Board-model dict for what a foundation shows once `card` leaves it."""
+    rv = rank_val(card[0]) - 1
+    if rv < 0:
+        return None
+    return {"rank": RANK_ORDER[rv], "suit": card[1], "color": card_color(card[1]),
+            "score": 1.0, "reliable": True}
 
 
 # ==============================================================================
@@ -238,6 +305,11 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
         start_coords = get_element_coords(board, "waste", None)
         end_coords = get_element_coords(board, "col", cj)
 
+    elif kind == "found_to_col":
+        _, card, cj = move
+        start_coords = get_element_coords(board, "found", card[1])
+        end_coords = get_element_coords(board, "col", cj)
+
     elif kind in ("draw", "redeal"):
         # Same physical button either way - the game itself decides
         # whether the tap draws the next 3 cards or triggers the redeal.
@@ -266,6 +338,23 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
                 expected_card=card,
             )
             return False
+    elif kind == "found_to_col":
+        # The foundation pile for this suit must visibly show exactly this
+        # card; dragging from the wrong pile (or an empty box) would be worse
+        # than doing nothing.
+        slot_idx = find_foundation_slot(board, card[1])
+        top = board["foundation"][slot_idx] if slot_idx is not None else None
+        if not top or top.get("rank") != card[0] or top.get("suit") != card[1]:
+            print(f"[Warn] Skipping move {move}: foundation for {card[1]} "
+                  f"shows ({top}), not {card}; will re-read next cycle.")
+            emit(
+                "move_rejected",
+                move=move,
+                reason="foundation_top_mismatch",
+                physical_top=top,
+                expected_card=card,
+            )
+            return False
     elif kind in ("waste_to_found", "waste_to_col"):
         top = board["waste"][-1] if board["waste"] else None
         if not top or top.get("rank") != card[0] or top.get("suit") != card[1]:
@@ -286,8 +375,8 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
     # rank/color is misread; the move generator then proposes a legal move for
     # the wrong board. Fail closed before swiping if the visible target cannot
     # accept this card (or if its read is ambiguous).
-    if kind in ("col_to_col", "waste_to_col"):
-        cj = move[2] if kind == "col_to_col" else move[1]
+    if kind in ("col_to_col", "waste_to_col", "found_to_col"):
+        cj = move[2] if kind in ("col_to_col", "found_to_col") else move[1]
         destination = board.get(f"col{cj}", [])
         target = destination[-1] if destination else None
         card_color_value = card_color(card[1])
@@ -461,6 +550,25 @@ def reconcile_foundation_reads(board, accepted, pending, max_jump, emit, now, ex
     return notes
 
 
+def record_pulldown_in_history(board, accepted, pending, card):
+    """Tell the foundation tracker a pile legitimately shrank by one card.
+
+    reconcile_foundation_reads() treats a shrinking pile as an impossible
+    read (piles never shrink in normal play), so without this the next
+    frames after a pull-down would be rejected and the bot would keep
+    believing the pulled card was still banked. Call it after a
+    found_to_col gesture succeeds, before apply_move_to_board().
+    Returns the slot index updated, or None.
+    """
+    slot_idx = find_foundation_slot(board, card[1])
+    if slot_idx is None:
+        return None
+    below = foundation_card_below(card)
+    accepted[slot_idx] = dict(below) if below else None
+    pending.pop(slot_idx, None)
+    return slot_idx
+
+
 def count_unresolved_cards(board):
     unresolved = 0
     for idx in range(7):
@@ -474,7 +582,7 @@ def count_unresolved_cards(board):
     return unresolved
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Automated Solitaire Stash Bot")
     parser.add_argument(
         "--sim",
@@ -513,6 +621,14 @@ def main():
              "only when mimicking a human cadence matters more than speed.",
     )
     parser.add_argument(
+        "--no-foundation-pulldown",
+        action="store_true",
+        help="Race solver: never pull a card back off a foundation onto the "
+             "tableau. By default the race solver may do so as a last resort, "
+             "at most once per card per run, and only when the pulled card "
+             "immediately takes the waste card or a revealing column run.",
+    )
+    parser.add_argument(
         "--max-stuck-cycles",
         type=int,
         default=15,
@@ -549,17 +665,23 @@ def main():
     parser.add_argument(
         "--solver",
         choices=["search", "monte-carlo", "race"],
-        default="search",
+        default="race",
         help="Choose the move-selection engine. 'race' is the timed-round "
              "policy: instant greedy selection (no search budget), strict "
              "foundation > reveal > empty-column priority, refuses moves that "
              "neither reveal nor found (the in-place shuffle), and plays "
              "several moves per screen read. Use it when a countdown is "
-             "running - see race_policy.py. Default: search."
+             "running - see race_policy.py. Default: race."
+    )
+    parser.add_argument(
+        "--solver-time-limit", type=float, default=0.5,
+        help="Total search/Monte Carlo decision budget per cycle, in seconds. "
+             "Default: 0.5. Race mode uses its bounded lookahead instead.",
     )
     parser.add_argument(
         "--save-screenshots", action="store_true",
-        help="Save each accepted live frame to live_screen.png for diagnostics.",
+        help="Save each live capture to live_screen.png for diagnostics. "
+             "--debug-draws also enables saving; ordinary live reads stay in memory.",
     )
     parser.add_argument(
         "--log-file",
@@ -592,7 +714,16 @@ def main():
         action="store_true",
         help="Clear the Android log buffer before capture starts."
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.solver_time_limit) or args.solver_time_limit <= 0:
+        parser.error("--solver-time-limit must be a finite positive number")
+    if args.swipe_ms is not None and args.swipe_ms <= 0:
+        parser.error("--swipe-ms must be positive")
+    return args
+
+
+def main():
+    args = parse_args()
 
     if args.interval is None:
         args.interval = (0.05 if args.fast else 1.0)
@@ -692,6 +823,11 @@ def main():
     # one cycle.
     foundation_accepted = {}
     foundation_pending = {}
+    # Cards pulled back off a foundation this run (race solver). Each card
+    # may be pulled at most once per run - the hard bound that stops the
+    # pull-down move from ever cycling (see race_policy's pull-down notes).
+    pulled_down_cards = set()
+    auto_complete_frames = 0
     last_cycle_found_plays = 0
     last_cycle_found_cards = []
     debug_draw_count = 0
@@ -714,6 +850,7 @@ def main():
     nongameplay_frames = 0
     capture_worker = None
     frame_sequence = 0
+    stock_history = StockHistory(STOCK_TOTAL)
 
     try:
         if not sim_mode:
@@ -745,6 +882,7 @@ def main():
             run_mode=bridge.RUN_MODE,
             moves_per_cycle=args.moves_per_cycle,
             interval_seconds=args.interval,
+            solver_time_limit=args.solver_time_limit,
             started_local=datetime.now().isoformat(),
         )
 
@@ -770,12 +908,13 @@ def main():
 
                 if img:
                     frame_sequence = frame.sequence
-                    if args.save_screenshots:
+                    if args.save_screenshots or args.debug_draws:
+                        # Read in memory; write a PNG only for diagnostics.
                         img.save(screenshot_file, compress_level=1)
                     log_event(
                         "screenshot_captured",
                         cycle=cycle_number,
-                        path=screenshot_file if args.save_screenshots else None,
+                        path=screenshot_file if (args.save_screenshots or args.debug_draws) else None,
                         duration_seconds=capture_seconds,
                     )
                 else:
@@ -855,12 +994,23 @@ def main():
             )
 
             state = build_solver_state(board, stock_total=STOCK_TOTAL)
+            state["issues"] = trust_notes + state["issues"]
+            history_notes = stock_history.observe(state)
+            for note in history_notes:
+                log_event("stock_history", cycle=cycle_number, message=note)
+            if state["previous_moves_dispatched"]:
+                log_event(
+                    "move_verification", cycle=cycle_number,
+                    dispatched=state["previous_moves_dispatched"],
+                    confirmed=state["previous_moves_confirmed"],
+                )
             cols = state["cols"]
             waste = state["waste"]
             found = state["found"]
             stock_remaining = state["stock_remaining"]
             truncated_columns = state["truncated_columns"]
-            issues = trust_notes + state["issues"]
+            issues = state["issues"]
+            stock_cards = state["stock_cards"]
             for msg in issues:
                 print(f"[Warn] {msg}")
 
@@ -947,7 +1097,11 @@ def main():
             founded_count = sum(v + 1 for v in found.values())
             face_down = sum(1 for c in cols for card in c if card == UNKNOWN)
             tableau_cards = sum(len(c) for c in cols)
-            progress = founded_count * 100 + tableau_cards - face_down
+            # A pulled-down card was banked once; credit it so taking it back
+            # down for a payoff move doesn't read as going backwards. The
+            # credit only grows (once per card), so it can't hide a loop.
+            progress = ((founded_count + len(pulled_down_cards)) * 100
+                        + tableau_cards - face_down)
             confirmed = (progress if prev_progress is None
                          else min(progress, prev_progress))
             prev_progress = progress
@@ -985,6 +1139,8 @@ def main():
                 stock_remaining=stock_remaining,
                 truncated_columns=truncated_columns,
                 issues=issues,
+                stock_history_synced=state["stock_history_synced"],
+                stock_cards=stock_cards,
             )
 
             # execute_move() only confirms a gesture was dispatched, not that
@@ -1040,14 +1196,29 @@ def main():
                 # and with face-down cards the search couldn't plan past the
                 # first one anyway (it reported "exhausted" every cycle).
                 solver_started = time.perf_counter()
-                state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
+                state = State(cols, waste, stock_remaining, STOCK_TOTAL, found, stock=stock_cards)
                 batch_cap = args.moves_per_cycle if args.moves_per_cycle > 0 else 8
                 excluded_first_moves.update(
                     move for signature, move in permanently_excluded_by_state
                     if signature == current_solver_signature
                 )
+                if race_policy.auto_complete_ready(state):
+                    auto_complete_frames += 1
+                    print("[*] Every card is face up and the draw pile is played out; "
+                          "the game auto-completes from here.")
+                    log_event("auto_complete_ready", cycle=cycle_number,
+                              consecutive=auto_complete_frames)
+                    if auto_complete_frames >= 2:
+                        print("[*] Confirmed on two reads. Stopping so the game can finish.")
+                        break
+                else:
+                    auto_complete_frames = 0
                 batch = race_policy.plan_batch(
                     state, max_moves=batch_cap, exclude=excluded_first_moves,
+                    pulled_down=None if args.no_foundation_pulldown else pulled_down_cards,
+                    # Leave docking to auto-complete unless that endgame has
+                    # stalled; then bank cards before the clock runs out.
+                    endgame=cycles_without_progress < ENDGAME_DOCK_AFTER_CYCLES,
                 )
                 track_move_failures = len(batch) == 1
                 solver_seconds = time.perf_counter() - solver_started
@@ -1094,14 +1265,31 @@ def main():
                 if batch:
                     previous_first_move = batch[0]
                     print(f"[*] Race: executing {len(batch)} move(s) this cycle:")
+                    # Mirror the plan on the solver state so the waste fan can
+                    # be modelled through draws that stock history confirmed.
+                    batch_sim = state
+                    fan_count = len(board["waste"])
                     for idx, move in enumerate(batch):
                         print(f"  {idx + 1}. {move}")
                         ok = execute_move(
                             board, move, sim_mode=sim_mode, event_logger=log_event,
                         )
+                        if ok:
+                            stock_history.record_move(move)
                         if ok and move[0] in ("col_to_found", "waste_to_found"):
                             last_cycle_found_plays += 1
                             last_cycle_found_cards.append(move[2] if move[0] == "col_to_found" else move[1])
+                        if move[0] == "found_to_col":
+                            # Count the attempt whether or not the gesture
+                            # was dispatched: a pull-down that keeps failing
+                            # must not be retried every cycle either.
+                            pulled_down_cards.add(move[1])
+                            if ok:
+                                slot = record_pulldown_in_history(
+                                    board, foundation_accepted, foundation_pending, move[1],
+                                )
+                                log_event("foundation_pulldown", cycle=cycle_number,
+                                          card=move[1], target_col=move[2], slot=slot)
                         log_event(
                             "move_result", cycle=cycle_number, batch_index=idx,
                             move=move, success=ok,
@@ -1109,17 +1297,29 @@ def main():
                         if not ok:
                             print("[*] Stopping batch early; re-reading next cycle.")
                             break
-                        if move[0] in ("draw", "redeal"):
+                        if idx == len(batch) - 1:
                             break
-                        apply_move_to_board(board, move)
+                        batch_sim = apply_move(batch_sim, move)
+                        if move[0] in ("draw", "redeal"):
+                            # Only reached when stock history confirmed what
+                            # this draw turns up (race_policy.plan_batch).
+                            if not sim_mode:
+                                time.sleep(MID_BATCH_DRAW_SETTLE_SECONDS)
+                        else:
+                            apply_move_to_board(board, move)
+                        if move[0] in ("draw", "redeal", "waste_to_found", "waste_to_col"):
+                            fan_count = next_fan_count(fan_count, move, batch_sim)
+                            board["waste"] = waste_fan_from_state(batch_sim, fan_count)
                 else:
                     print("[*] Race: no productive move available (board stuck).")
                     log_event("no_move_selected", cycle=cycle_number, solver="race")
             elif args.solver == "monte-carlo":
                 print("[*] Running Monte Carlo move search...")
                 solver_started = time.perf_counter()
-                state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
-                move, statistics = choose_move_monte_carlo(state)
+                state = State(cols, waste, stock_remaining, STOCK_TOTAL, found, stock=stock_cards)
+                move, statistics = choose_move_monte_carlo(
+                    state, time_limit=args.solver_time_limit,
+                )
                 solver_seconds = time.perf_counter() - solver_started
                 print_statistics(statistics)
 
@@ -1150,6 +1350,8 @@ def main():
                         sim_mode=sim_mode,
                         event_logger=log_event,
                     )
+                    if ok:
+                        stock_history.record_move(move)
                     if ok and move[0] in ("col_to_found", "waste_to_found"):
                         last_cycle_found_plays += 1
                         last_cycle_found_cards.append(move[2] if move[0] == "col_to_found" else move[1])
@@ -1165,19 +1367,25 @@ def main():
             else:
                 print("[*] Searching for a path...")
                 solver_started = time.perf_counter()
+                solver_deadline = time.monotonic() + args.solver_time_limit
+                path, explored, status = [], 0, "timeout"
                 cycle_guard_excluded = set()
                 state_permanent_exclusions = {
                     move for (signature, move) in permanently_excluded_by_state
                     if signature == current_solver_signature
                 }
                 for _attempt in range(4):
+                    remaining_budget = solver_deadline - time.monotonic()
+                    if remaining_budget <= 0:
+                        break
                     path, explored, solved, status = solve(
                         cols,
                         initial_waste=waste,
                         initial_stock_remaining=stock_remaining,
                         initial_stock_total=STOCK_TOTAL,
                         initial_found=found,
-                        time_limit=5.0,
+                        time_limit=remaining_budget,
+                        initial_stock=stock_cards,
                         excluded_first_moves=(
                             excluded_first_moves | cycle_guard_excluded | state_permanent_exclusions
                         ),
@@ -1193,7 +1401,7 @@ def main():
                     # each individual move genuinely succeeds (the
                     # single-previous-cycle stuck-move check above never
                     # fires), it just never goes anywhere.
-                    start_state = State(cols, waste, stock_remaining, STOCK_TOTAL, found)
+                    start_state = State(cols, waste, stock_remaining, STOCK_TOTAL, found, stock=stock_cards)
                     next_state = apply_move(start_state, path[0])
                     next_signature = (
                         next_state.cols, next_state.waste,
@@ -1212,9 +1420,7 @@ def main():
                     # looking moves are symmetric under the heuristic (e.g.
                     # a red 6 that stacks equally well on either of two
                     # black 7s), both get excluded here, attempts run out,
-                    # and the "proceeding with the best one found anyway"
-                    # fallback below just re-executes the same oscillation
-                    # next cycle. Track repeat offenders the same way the
+                    # Track repeat offenders the same way the
                     # stuck-move guard above does, so a move caught cycling
                     # from this exact state several times gets permanently
                     # excluded from it instead of oscillating forever.
@@ -1233,9 +1439,9 @@ def main():
                             reason="cycling",
                         )
                         permanently_excluded_by_state.add(cycle_failure_key)
+                    path, solved, status = [], False, "cycle_excluded"
                 else:
-                    print("[Warn] Could not find a non-cycling move after several "
-                          "attempts; proceeding with the best one found anyway.")
+                    print("[Warn] No non-cycling move found within the decision budget.")
                 solver_seconds = time.perf_counter() - solver_started
                 log_event(
                     "solver_finished",
@@ -1262,6 +1468,8 @@ def main():
                             sim_mode=sim_mode,
                             event_logger=log_event,
                         )
+                        if ok:
+                            stock_history.record_move(move)
                         if ok and move[0] in ("col_to_found", "waste_to_found"):
                             last_cycle_found_plays += 1
                             last_cycle_found_cards.append(move[2] if move[0] == "col_to_found" else move[1])

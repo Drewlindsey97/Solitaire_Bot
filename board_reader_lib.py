@@ -3,7 +3,26 @@ import glob
 import os
 import numpy as np
 
-STEP = 50
+# Vertical distance between stacked face-up cards. The current game on the
+# Galaxy A21 spaces cards 48 px apart; older recordings in Gameplay/ fit
+# 50 px. A fixed 50 drifted 2 px per card on the live layout, so the crops on
+# an 11-card column landed 20 px low - live on 2026-10-10 the bottom 3S was
+# read from its centre "3" as 8C. column_step() picks, per column, the
+# spacing whose whole number of cards best fits the measured height.
+STEP = 48
+STEP_CANDIDATES = (48, 50)
+
+
+def column_step(revealed_span):
+    best, best_err = STEP, None
+    for step in STEP_CANDIDATES:
+        rows = (revealed_span - 135) / step
+        if rows < 1.5:  # too short to tell; drift is negligible anyway
+            return STEP
+        err = abs(rows - round(rows))
+        if best_err is None or err < best_err - 1e-9:
+            best, best_err = step, err
+    return best
 RANK_W, RANK_H = 45, 45
 # The suit pip sits beside the rank digit in the same top corner index, not
 # below it: mirror the rank patch's box onto the right half of the card.
@@ -52,8 +71,8 @@ WASTE_PEAK_THRESHOLD = 0.65
 MIN_FOUNDATION_SCORE = 0.3
 
 # Confirmed live by tapping through an entire stock cycle: 24 cards, drawn
-# 3 at a time (8 taps to exhaust), then an unlimited, deterministic redeal
-# (the same 24 cards return in the same order every cycle). The deal shape
+# 3 at a time (8 taps initially), then unlimited, deterministic redeals of
+# the remaining waste cards in their original order. The deal shape
 # is always the classic 1-7 tableau triangle (28 cards), so stock is always
 # the fixed remainder: 52 - 28 = 24.
 STOCK_TOTAL = 24
@@ -85,6 +104,23 @@ def load_templates(folder):
 
 TEMPLATES = load_templates("templates")
 TEMPLATES_LAST = load_templates("templates_last")
+
+
+def _mask_suit_pip(binary):
+    """Blank the corner suit pip of a full-card binary image.
+
+    Full-card templates carry their suit pip, and two ranks of the same suit
+    share an identical pip in the same place - live 2026-10-10 a 3H on a
+    foundation matched the 2H template (0.853) over 3H (0.850). Rank is
+    decided on the digit and the centre numeral only; suit has its own
+    matcher.
+    """
+    out = binary.copy()
+    out[0:SUIT_Y_OFF + SUIT_H, SUIT_X_OFF:SUIT_X_OFF + SUIT_W] = 0
+    return out
+
+
+TEMPLATES_LAST_RANK_ONLY = {name: _mask_suit_pip(t) for name, t in TEMPLATES_LAST.items()}
 SUIT_TEMPLATES = load_templates("suit_templates")
 
 # Red-ink gate: red hue (OpenCV hue wraps at 180 - this game's red ink is
@@ -139,9 +175,11 @@ def classify_suit_color(patch):
                 (color == "BLACK" and ink_frac <= AMBIG_INK_FRAC_LO)
     return color, confident
 
-def match_rank(patch, template_set):
+def match_rank(patch, template_set, mask_suit=False):
     gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    if mask_suit:
+        binary = _mask_suit_pip(binary)
     padded = cv2.copyMakeBorder(binary, PAD, PAD, PAD, PAD, cv2.BORDER_CONSTANT, value=0)
 
     best_name, best_score = "?", -1
@@ -175,6 +213,47 @@ def match_rank(patch, template_set):
 # vice versa) - a cross-color mismatch measured in practice (a black
 # card's best raw template score sometimes lands on a red suit) that pure
 # shape-matching over all 4 templates can't rule out on its own.
+# Club vs spade by shape, not template score. Template scores for the two
+# black suits can nearly tie (live 2026-10-10: a QC scored 0.917 against a
+# spade template and 0.898 against the best club template and was read as
+# QS). Solidity - pip area over its convex-hull area - separates them
+# cleanly: a club's three lobes leave notches (corpus median 0.804, p95
+# 0.806) while a spade's single outline fills its hull (median 0.843, p5
+# about 0.825 when anti-aliasing softens it). Only a clean, pip-sized,
+# uncropped blob is trusted; anything else falls back to the templates.
+CLUB_SOLIDITY_MAX = 0.815
+SPADE_SOLIDITY_MIN = 0.82
+PIP_MIN_SIDE, PIP_MAX_SIDE = 20, 34
+PIP_MIN_AREA, PIP_MAX_AREA = 300, 650
+
+
+def black_pip_suit(patch):
+    """Return "C", "S", or None (no confident shape verdict) for a black pip."""
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(contour)
+    x, y, w, h = cv2.boundingRect(contour)
+    if not (PIP_MIN_AREA <= area <= PIP_MAX_AREA
+            and PIP_MIN_SIDE <= w <= PIP_MAX_SIDE and PIP_MIN_SIDE <= h <= PIP_MAX_SIDE):
+        return None
+    ph, pw = binary.shape
+    if x <= 0 or y <= 0 or x + w >= pw or y + h >= ph:
+        return None  # cut off by the crop edge: shape is incomplete
+    hull_area = cv2.contourArea(cv2.convexHull(contour))
+    if hull_area <= 0:
+        return None
+    solidity = area / hull_area
+    if solidity <= CLUB_SOLIDITY_MAX:
+        return "C"
+    if solidity >= SPADE_SOLIDITY_MIN:
+        return "S"
+    return None
+
+
 def match_suit(patch, color, template_set=SUIT_TEMPLATES):
     if color not in ("BLACK", "RED"):
         # Fail closed: with no color evidence, matching across all 4
@@ -187,7 +266,17 @@ def match_suit(patch, color, template_set=SUIT_TEMPLATES):
         name: tmpl for name, tmpl in template_set.items() if name.split("_")[0] in candidates
     }
     name, score = match_rank(patch, narrowed)
-    return name.split("_")[0], score
+    suit = name.split("_")[0]
+    if color == "BLACK":
+        shape_suit = black_pip_suit(patch)
+        if shape_suit is not None and shape_suit != suit:
+            # Trust the shape; report the best template score for that suit
+            # so downstream confidence still reflects a real match.
+            _, score = match_rank(patch, {
+                n: t for n, t in narrowed.items() if n.split("_")[0] == shape_suit
+            })
+            suit = shape_suit
+    return suit, score
 
 def detect_waste_slots(img):
     """Dynamically locate each visible waste-pile card's corner rank digit,
@@ -332,7 +421,8 @@ def read_board_image(img):
             continue
 
         revealed_span = height - hidden_count * HIDDEN_CARD_H
-        num_rows = round((revealed_span - 135) / 50) + 1
+        step = column_step(revealed_span)
+        num_rows = round((revealed_span - 135) / step) + 1
         num_rows = max(1, num_rows)
 
         # face-down cards have no readable rank; represent them as unknown
@@ -341,7 +431,7 @@ def read_board_image(img):
 
         y_start = TABLEAU_Y_TOP + hidden_count * HIDDEN_CARD_H
         for row in range(num_rows):
-            y = y_start + row * STEP
+            y = y_start + int(round(row * step))
             is_last = (row == num_rows - 1)
 
             # The suit pip lives in the same top-corner index box regardless
@@ -354,7 +444,7 @@ def read_board_image(img):
 
             if is_last:
                 rank_patch = img[y:y+90, x:x+95]
-                name, score = match_rank(rank_patch, TEMPLATES_LAST)
+                name, score = match_rank(rank_patch, TEMPLATES_LAST_RANK_ONLY, mask_suit=True)
             else:
                 rank_patch = img[y:y+RANK_H, x:x+RANK_W]
                 name, score = match_rank(rank_patch, TEMPLATES)
@@ -386,7 +476,7 @@ def read_board_image(img):
         gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
         if gray.std() < 15:
             return None
-        name, score = match_rank(patch, TEMPLATES_LAST)
+        name, score = match_rank(patch, TEMPLATES_LAST_RANK_ONLY, mask_suit=True)
         suit_patch = img[SLOT_Y+SUIT_Y_OFF:SLOT_Y+SUIT_Y_OFF+SUIT_H, x+SUIT_X_OFF:x+SUIT_X_OFF+SUIT_W]
         color, color_confident = classify_suit_color(suit_patch)
         suit, suit_score = match_suit(suit_patch, color)

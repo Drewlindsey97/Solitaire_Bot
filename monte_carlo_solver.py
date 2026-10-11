@@ -167,6 +167,7 @@ def rollout(
     expected_total: int,
     rng: random.Random,
     max_depth: int = 1000,
+    deadline: Optional[float] = None,
 ) -> tuple[float, bool, int]:
     """
     Play a randomized simulated continuation.
@@ -185,6 +186,8 @@ def rollout(
     visited = {state.key()}
 
     for depth in range(max_depth):
+        if deadline is not None and time.monotonic() >= deadline:
+            return evaluate_state(state, expected_total), False, depth
         if is_solved(state, expected_total):
             return WIN_SCORE, True, depth
 
@@ -250,20 +253,22 @@ def choose_move_monte_carlo(
     from freecell_solver import is_safe_autoplay
 
     found = state.found_dict()
-    safe_exclude = set()
+    safe_moves = []
     for ci, col in enumerate(state.cols):
         if col and is_safe_autoplay(col[-1], found):
-            safe_exclude.add(("col_to_found", ci, col[-1]))
+            safe_moves.append(("col_to_found", ci, col[-1]))
     waste_top = state.waste[-1] if state.waste else None
     if waste_top is not None and is_safe_autoplay(waste_top, found):
-        safe_exclude.add(("waste_to_found", waste_top))
+        safe_moves.append(("waste_to_found", waste_top))
+
+    safe_exclude = set(safe_moves)
 
     legal_moves = generate_moves(state, exclude=safe_exclude if safe_exclude else None)
     if safe_exclude:
         # generate_moves() also strips `exclude` from its own result as a
         # final filter, so re-add the safe autoplays it just removed - we
         # only wanted to bypass the short-circuit, not drop them entirely.
-        legal_moves = list(legal_moves) + [m for m in safe_exclude if m not in legal_moves]
+        legal_moves = list(legal_moves) + [m for m in safe_moves if m not in legal_moves]
 
     if not legal_moves:
         return None, []
@@ -271,7 +276,7 @@ def choose_move_monte_carlo(
     # If only one legal move remains, just return it (cheap path)
     if len(legal_moves) == 1:
         only_move = legal_moves[0]
-        return only_move, [MoveStatistics(move=only_move, visits=1, wins=0, total_score=0.0)]
+        return only_move, [MoveStatistics(move=only_move)]
 
     rng = random.Random(seed)
     expected_total = total_card_count(state)
@@ -282,6 +287,7 @@ def choose_move_monte_carlo(
     ]
 
     started_at = time.monotonic()
+    deadline = started_at + time_limit
     completed_simulations = 0
     move_index = 0
 
@@ -307,6 +313,7 @@ def choose_move_monte_carlo(
             expected_total=expected_total,
             rng=rng,
             max_depth=max_depth,
+            deadline=deadline,
         )
 
         stats.visits += 1
@@ -325,6 +332,11 @@ def choose_move_monte_carlo(
         ),
         reverse=True,
     )
+
+    if not completed_simulations:
+        # An exhausted/zero budget must not choose an arbitrary opening draw
+        # ahead of a known productive move, or claim that a trial occurred.
+        statistics.sort(key=lambda item: move_priority(state, item.move), reverse=True)
 
     return statistics[0].move, statistics
 
