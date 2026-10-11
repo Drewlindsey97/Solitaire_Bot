@@ -22,7 +22,8 @@ than reimplementing them, so anything illegal here was already illegal there.
 """
 
 from freecell_solver import (
-    UNKNOWN, rank_val, generate_moves, apply_move, can_found,
+    UNKNOWN, RANK_ORDER, rank_val, generate_moves, apply_move, can_found,
+    can_stack, is_safe_autoplay,
 )
 
 # Score weights. Ordering matters far more than exact magnitudes: the intent
@@ -192,8 +193,238 @@ def _reachable_gain(state, depth, seen):
     return best
 
 
+# ------------------------------------------------------------------------------
+# Foundation pull-down ("found_to_col")
+# ------------------------------------------------------------------------------
+# Klondike lets the top card of a foundation come back down onto the tableau.
+# Observed live: the bot stopped as "stuck" with 5S banked, a 6D open on the
+# tableau and a red 4 coming up in the draw cycle. Pulling the 5S back down
+# onto the 6D gave the red 4 a home and the round carried on - but no move
+# generator here offered that move, so the bot drew through the stock until
+# the no-progress stop fired.
+#
+# A pull-down undoes a foundation play, so taken carelessly it can loop
+# forever (down, back up, down...). It is therefore boxed in on every side:
+#   1. Only the race policy proposes it; generate_moves() never does, so the
+#      search and Monte Carlo solvers are unaffected.
+#   2. Last resort: considered only when the policy would otherwise draw,
+#      redeal, or give up - never when any direct progress move exists.
+#   3. Immediate payoff: the pulled card must at once accept the waste top
+#      or a column run whose move reveals a face-down card. (Emptying a
+#      column was tried as a payoff too; over 2000 simulated deals it lost
+#      cards on net, so it doesn't count.) That follow-up is played in the same batch, which covers the
+#      pulled card so it cannot simply go straight back up.
+#   4. Never a card nobody could need: if the card would be a safe autoplay
+#      straight back to its foundation (so no tableau card can ever want to
+#      sit on it - this also rules out every Ace and 2), it stays put.
+#   5. Once per card: the caller passes every card already pulled down this
+#      run in `pulled_down`, and a card in that set is never pulled again.
+#      With 52 cards that bounds the total number of pull-downs per run, so
+#      even a pathological board cannot cycle on this move.
+#   6. At most one pull-down chain per batch (plan_batch), of at most
+#      MAX_PULLDOWN_CHAIN pulls; the payoff must land on the last card
+#      pulled. A King may come down into an empty column.
+#   7. The bot's no-progress stop still applies on top of all of this.
+
+
+def _pulldown_followup(after, card, cj):
+    """The move that uses a just-pulled-down card, or None.
+
+    `after` is the state with `card` already sitting on top of column cj.
+    Preference: a column run that reveals a face-down card, then the waste
+    top. A follow-up that only relocates exposed cards (or merely empties a
+    column) is not a payoff and is never accepted.
+    """
+    reveal_move = None
+    for ci, col in enumerate(after.cols):
+        if ci == cj or not col or col[-1] == UNKNOWN:
+            continue
+        max_run = 1
+        while (max_run < len(col) and col[-max_run - 1] != UNKNOWN
+               and can_stack(col[-max_run], col[-max_run - 1])):
+            max_run += 1
+        for run_length in range(1, max_run + 1):
+            start = col[-run_length]
+            if not can_stack(start, card):
+                continue
+            if _col_reveals(col, run_length):
+                reveal_move = reveal_move or ("col_to_col", ci, cj, start, run_length)
+    if reveal_move:
+        return reveal_move
+    waste_top = after.waste[-1] if after.waste and after.waste[-1] != UNKNOWN else None
+    if waste_top is not None and can_stack(waste_top, card):
+        return ("waste_to_col", cj, waste_top)
+    return None
+
+
+# Longest chain of pull-downs considered before the payoff move. Live
+# 2026-10-10 the bot stopped at 44 cards: J-D on the waste needed a black
+# queen, and the only way was K-S off its foundation into an empty column,
+# then Q-S onto the K-D. Chains are rare, so keep them short.
+MAX_PULLDOWN_CHAIN = 3
+
+
+def _pulldown_moves(state, pulled_down, used):
+    """Single pull-down candidates: a foundation top onto a column card that
+    takes it, or a King into the first empty column."""
+    found = state.found_dict()
+    for suit, top in sorted(found.items()):
+        if top < 0:
+            continue
+        card = (RANK_ORDER[top], suit)
+        if card in pulled_down or card in used:
+            continue
+        lowered = dict(found)
+        lowered[suit] = top - 1
+        if is_safe_autoplay(card, lowered):
+            continue
+        empty_offered = False
+        for cj, col in enumerate(state.cols):
+            if not col:
+                if card[0] == "K" and not empty_offered:
+                    empty_offered = True
+                    yield ("found_to_col", card, cj)
+                continue
+            if col[-1] != UNKNOWN and can_stack(card, col[-1]):
+                yield ("found_to_col", card, cj)
+
+
+def choose_pulldown(state, pulled_down=frozenset()):
+    """Best (pulldown_moves, followup_move) for this state, or None.
+
+    pulldown_moves is a chain of 1..MAX_PULLDOWN_CHAIN pull-downs; the
+    follow-up must land on the LAST card pulled, so every pull in the chain
+    is needed for the payoff. Applies every guard in the section comment
+    above except "last resort", which choose_move() enforces.
+    """
+    best, best_key = None, None
+
+    def search(sim, chain, used):
+        nonlocal best, best_key
+        if len(chain) >= MAX_PULLDOWN_CHAIN:
+            return
+        for move in _pulldown_moves(sim, pulled_down, used):
+            after = apply_move(sim, move)
+            card, cj = move[1], move[2]
+            follow = _pulldown_followup(after, card, cj)
+            new_chain = chain + [move]
+            if follow is not None:
+                # shorter chains first; reveal (0) beats waste (1); then the
+                # lowest cards, keeping foundations as high as possible.
+                kind_rank = 0 if follow[0] == "col_to_col" else 1
+                key = (len(new_chain), kind_rank, sum(rank_val(m[1][0]) for m in new_chain))
+                if best_key is None or key < best_key:
+                    best_key, best = key, (tuple(new_chain), follow)
+            else:
+                search(after, new_chain, used | {card})
+
+    search(state, [], frozenset())
+    return best
+
+
+# ------------------------------------------------------------------------------
+# Auto-complete endgame
+# ------------------------------------------------------------------------------
+# Observed live (user report 2026-10-10): once every tableau card is face up
+# AND the stock and waste are both empty, the game finishes the round by
+# itself. Docking cards one at a time before that point only burns clock, so
+# with nothing face down the policy's job becomes getting the remaining
+# stock/waste cards into play, then stopping.
+
+
+def no_hidden_cards(state):
+    return all(card != UNKNOWN for col in state.cols for card in col)
+
+
+def auto_complete_ready(state):
+    """Every card face up and the draw pile fully played: the game takes over."""
+    return state.stock_remaining == 0 and not state.waste and no_hidden_cards(state)
+
+
+def _waste_playable(state):
+    top = state.waste[-1] if state.waste else None
+    if top is None or top == UNKNOWN:
+        return False
+    if can_found(top, state.found_dict()):
+        return True
+    return any((not col and top[0] == "K") or (col and can_stack(top, col[-1]))
+               for col in state.cols)
+
+
+ENDGAME_DOCK_DEPTH = 8
+
+
+def _legal_dockings(state):
+    found = state.found_dict()
+    return [("col_to_found", ci, col[-1]) for ci, col in enumerate(state.cols)
+            if col and can_found(col[-1], found)]
+
+
+def _first_enabling_move(state, candidates):
+    """First move of the shortest line that makes the waste card playable.
+
+    The line starts with one of `candidates` and continues with dockings
+    only. Dockings only ever raise the foundations, so the search cannot
+    cycle; depth and a visited set keep it small.
+    """
+    frontier = []
+    seen = set()
+    for m in candidates:
+        try:
+            nxt = apply_move(state, m)
+        except Exception:
+            continue
+        if _waste_playable(nxt):
+            return m
+        if nxt.key() not in seen:
+            seen.add(nxt.key())
+            frontier.append((nxt, m))
+    for _ in range(ENDGAME_DOCK_DEPTH - 1):
+        nxt_frontier = []
+        for sim, first in frontier:
+            for d in _legal_dockings(sim):
+                after = apply_move(sim, d)
+                if _waste_playable(after):
+                    return first
+                if after.key() not in seen:
+                    seen.add(after.key())
+                    nxt_frontier.append((after, first))
+        frontier = nxt_frontier
+        if not frontier:
+            break
+    return None
+
+
+def _choose_endgame(state, exclude, pulldown_or):
+    """Move choice once no face-down cards remain (see section above)."""
+    exclude = set(exclude or ())
+    # Tableau-to-foundation plays are never forced here: they only help when
+    # they open a landing spot for the waste card.
+    found = state.found_dict()
+    dockings = {("col_to_found", ci, col[-1]) for ci, col in enumerate(state.cols)
+                if col and can_found(col[-1], found)}
+    moves = generate_moves(state, exclude=exclude | dockings)
+    waste_moves = [m for m in moves if m[0] in ("waste_to_found", "waste_to_col")]
+    if waste_moves:
+        waste_moves.sort(key=lambda m: 0 if m[0] == "waste_to_found" else 1)
+        return waste_moves[0]
+    if not _waste_playable(state):
+        first = _first_enabling_move(state, [m for m in dockings if m not in exclude]
+                                     + [m for m in moves if m[0] == "col_to_col"])
+        if first is not None:
+            return first
+    stock = [m for m in moves if m[0] in ("draw", "redeal")]
+    if not stock:
+        if state.stock_remaining > 0:
+            stock = [("draw",)]
+        elif state.stock_total > 0 and state.waste:
+            stock = [("redeal",)]
+    stock = [m for m in stock if m not in exclude]
+    return pulldown_or(stock[0] if stock else None)
+
+
 def choose_move(state, exclude=None, allow_null_shuffle=False,
-                lookahead_depth=LOOKAHEAD_DEPTH):
+                lookahead_depth=LOOKAHEAD_DEPTH, pulled_down=None, endgame=True):
     """Best single move for the clock, or None if nothing is worth doing.
 
     Direct progress (a foundation play, a reveal, an empty-column gain, a waste
@@ -202,9 +433,33 @@ def choose_move(state, exclude=None, allow_null_shuffle=False,
     that unblocks a foundation from a dead one. Returns None rather than a dead
     shuffle unless allow_null_shuffle is set, so the caller can draw instead.
     """
+    def pulldown_or(fallback):
+        # Last resort only (see the pull-down section above): reached solely
+        # when the alternative is a draw, a redeal, or giving up. Passing
+        # pulled_down=None disables pull-downs entirely.
+        if pulled_down is not None:
+            pick = choose_pulldown(state, pulled_down)
+            if pick is not None and (not exclude or pick[0][0] not in exclude):
+                return pick[0][0]
+        return fallback
+
+    if endgame and auto_complete_ready(state):
+        return None  # the game finishes the round itself from here
+    if endgame and no_hidden_cards(state):
+        return _choose_endgame(state, exclude, pulldown_or)
+
     moves = generate_moves(state, exclude=exclude)
     if not moves:
-        return None
+        return pulldown_or(None)
+    # With confirmed stock history generate_moves() also offers the draw
+    # next to tableau moves. The ladder below is unchanged by that: real
+    # progress first, then setup relocations found by lookahead, and only
+    # then the draw (simulated over 2000 deals, letting a known draw outrank
+    # setup relocations cost ~1.6 banked cards per game).
+    stock_moves = [m for m in moves if m[0] in ("draw", "redeal")]
+    moves = [m for m in moves if m[0] not in ("draw", "redeal")]
+    if not moves:
+        return pulldown_or(stock_moves[0])
     scored = [(score_move(state, m), m) for m in moves]
     scored.sort(key=lambda sm: sm[0], reverse=True)
     best_score, best_move = scored[0]
@@ -231,15 +486,21 @@ def choose_move(state, exclude=None, allow_null_shuffle=False,
 
     # No relocation reaches any progress: draw to turn over new cards (same
     # clock cost, but the shuffle provably changes nothing).
+    if stock_moves:
+        return pulldown_or(stock_moves[0])
     if state.stock_remaining > 0:
-        return ("draw",)
-    if state.stock_total > 0:
-        return ("redeal",)
+        return pulldown_or(("draw",))
+    if state.stock_total > 0 and state.waste:
+        return pulldown_or(("redeal",))
     # No stock left and only dead shuffles remain: genuinely stuck.
-    return None
+    return pulldown_or(None)
 
 
-def plan_batch(state, max_moves=8, exclude=None):
+def _waste_top_known(state):
+    return bool(state.waste) and state.waste[-1] != UNKNOWN
+
+
+def plan_batch(state, max_moves=8, exclude=None, pulled_down=None, endgame=True):
     """Greedy sequence of moves from one screen read.
 
     Screen capture plus board read is the dominant per-cycle cost (~1s), so
@@ -248,23 +509,71 @@ def plan_batch(state, max_moves=8, exclude=None):
     outcome we can't predict:
 
     - draw/redeal reveal physically unknown cards, so anything planned after
-      one would be built on invented state
+      one would be built on invented state. Exception: when confirmed stock
+      history (stock_history.py) supplies the drawn identities, planning
+      continues through the draw and through waste plays.
     - a newly exposed card remains UNKNOWN, so its column is unavailable
       until the next read. Independent moves on known cards can continue,
       but drawing waits until the newly exposed card has been read.
+
+    endgame: with every tableau card face up, play the stock/waste out and
+    leave docking to the game's auto-complete (see that section). Callers
+    turn it off when that endgame stalls, so cards still get banked before
+    the clock runs out.
+
+    pulled_down: cards already pulled off a foundation this run (see the
+    pull-down section). None disables pull-downs. A pull-down is always
+    followed in the same batch by the move it was taken for, and at most
+    one pull-down happens per batch. A batch never ends on a pull-down: if
+    there is no room for its follow-up, the pull-down is not played.
     """
     batch = []
     sim = state
     seen = {sim.key()}
     needs_reveal_read = False
+    forced = []
+    pulldown_done = False
     for _ in range(max_moves):
-        move = choose_move(sim, exclude=exclude if not batch else None)
+        if forced:
+            move = forced.pop(0)
+        else:
+            move = choose_move(
+                sim, exclude=exclude if not batch else None,
+                pulled_down=None if (pulled_down is None or pulldown_done) else pulled_down,
+                endgame=endgame,
+            )
         if move is None:
             break
+        if move[0] == "found_to_col" and not pulldown_done:
+            pick = choose_pulldown(sim, pulled_down or frozenset())
+            plan = list(pick[0]) + [pick[1]] if pick and pick[0][0] == move else None
+            if plan is None or len(batch) + len(plan) > max_moves:
+                # No room for the pull-down and its payoff in this batch (or
+                # no payoff after all): play what we would have played
+                # without pull-downs instead - usually the draw.
+                pulldown_done = True
+                move = choose_move(sim, exclude=exclude if not batch else None, endgame=endgame)
+                if move is None:
+                    break
+            else:
+                pulldown_done = True
+                forced = plan[1:]
         if move[0] in ("draw", "redeal"):
-            if not needs_reveal_read:
-                batch.append(move)
-            break
+            if needs_reveal_read:
+                break
+            nxt = apply_move(sim, move)
+            if nxt.key() in seen:
+                break
+            seen.add(nxt.key())
+            batch.append(move)
+            sim = nxt
+            # Keep planning only when stock history has confirmed the card
+            # this draw turns up (a redeal turns up nothing; the draw that
+            # follows it is judged on its own). Without confirmed history the
+            # new waste top is UNKNOWN and the batch ends here, as before.
+            if move[0] == "draw" and not _waste_top_known(sim):
+                break
+            continue
         reveals = (
             move[0] == "col_to_col" and _col_reveals(sim.cols[move[1]], move[4])
             or move[0] == "col_to_found" and _col_reveals(sim.cols[move[1]], 1)
@@ -284,6 +593,13 @@ def plan_batch(state, max_moves=8, exclude=None):
         needs_reveal_read = needs_reveal_read or reveals
         if move[0] in ("waste_to_found", "waste_to_col"):
             # The next waste card was partly covered; read its full face
-            # before deciding to play it or draw past it.
-            break
+            # before deciding to play it or draw past it - unless stock
+            # history already confirmed it. An emptied waste also ends the
+            # batch: the read may not show older waste behind the fan.
+            if not _waste_top_known(sim):
+                break
+    # Belt and braces: a pull-down must never be the last physical move of a
+    # batch (its follow-up is what makes it worth doing).
+    while batch and batch[-1][0] == "found_to_col":
+        batch.pop()
     return batch

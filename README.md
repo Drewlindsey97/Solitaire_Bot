@@ -79,10 +79,37 @@ saves accepted frames and `--debug-draws` saves selected diagnostic frames.
 `--interval 0` removes that fixed pause and waits only for a fresh settled frame.
 Frame sequence, age, wait time, and motion fraction are recorded in the session log.
 
+Race mode is now the default for the timed game. Explicit `search` and
+`monte-carlo` runs use a 0.5-second decision budget per cycle; use
+`--solver-time-limit 2` (or another positive number of seconds) for a longer
+diagnostic comparison. Search retries share that budget rather than each
+starting a new one.
+
+Duplicate exposed card identities are reported as parsing issues and both
+conflicting reads become unknown, preserving their physical slots. The live
+stock tracker synchronizes at an empty waste and learns exposed identities
+only after fresh captures confirm the dispatched moves. It retains the full
+waste history behind the visible fan and reuses learned draw order on redeals.
+Untrusted or contradictory captures discard history; starting in the middle
+of a stock pass leaves its unseen history unknown until an empty-waste
+boundary is observed. Redeals return only the remaining waste cards, never
+replenishing cards already moved to tableau or foundations.
+
 Race mode can continue independent known-card moves after a hidden-card reveal.
 The revealed card remains unknown until the next capture, and drawing waits
-for that read. A waste-card move or draw/redeal still ends the batch. For a live
-run with up to ten moves per read and shorter drags:
+for that read. A draw or waste-card move ends the batch unless the stock
+tracker has confirmed the card that will be exposed; with confirmed history
+the batch plays through the draw (pausing 0.35 s for the animation) and
+through consecutive waste plays. Any mismatch on the next capture discards
+the history and falls back to one read per draw.
+
+When the race policy would otherwise draw, redeal, or stop, it may pull the
+top card of a foundation back onto the tableau, but only when that card
+immediately takes the waste card or a column run that reveals a face-down
+card. Each card is pulled down at most once per run, at most one pull-down
+happens per batch, and the no-progress stop still applies. Disable it with
+`--no-foundation-pulldown`. For a live run with up to ten moves per read and
+shorter drags:
 
 ```bash
 python3 solitaire_auto_bot.py --solver race --moves-per-cycle 10 --swipe-ms 650 --fast --interval 0 --logcat
@@ -124,6 +151,19 @@ python3 solitaire_auto_bot.py \
 ```
 
 Each line in the JSONL file is a complete JSON object, making the file easy to inspect with `jq`, Python, or a spreadsheet import.
+
+Summarize one session's timing and capture-confirmed transitions:
+
+```bash
+python3 session_metrics.py logs/my_session.jsonl
+```
+
+The report separates gesture dispatches, confirmed moves, confirmed unchanged
+boards, unverified moves, and moves still awaiting a capture. Confirmation
+uses the synchronized history and recognized state; it is not a ground-truth
+OCR accuracy or a measured final game score. Unsynchronized or contradictory
+reads are unverified, not counted as successful gestures. It also reports
+median capture/OCR/planning/cycle times and observed foundation progress.
 
 Example:
 

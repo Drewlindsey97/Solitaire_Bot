@@ -41,3 +41,14 @@ def test_memory_reader_matches_lossless_saved_pixels():
         path = ROOT / "Gameplay" / name
         rgb = np.asarray(Image.open(path).convert("RGB"))
         assert read_board_image(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)) == read_board(str(path))
+
+
+def test_live_stall_frame_reads_correctly():
+    # 2026-10-10 live stop: QC was read as QS (duplicating the real QS),
+    # the bottom 3S of an 11-card column as 8C, and the 3H foundation as 2H.
+    board = read_board(str(ROOT / "tests/fixtures/clubs-queen-read-as-spades.png"))
+    ids = lambda k: [c["rank"] + c["suit"] for c in board[k]]
+    assert ids("col0") == ["KC", "QD", "JS", "10H", "9S", "8D", "7C", "6D", "5C", "4D", "3S"]
+    assert ids("col2") == ["KH", "QC"]
+    assert ids("col5")[-1] == "QS"
+    assert [c["rank"] + c["suit"] for c in board["foundation"]] == ["AS", "3H", "AD", "2C"]

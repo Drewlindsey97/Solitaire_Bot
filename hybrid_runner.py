@@ -58,7 +58,8 @@ def run_hybrid(img_path, mc_time=30.0, top_k=3, per_move_time=50.0, total_search
             continue
         path, explored, solved, status = solve(
             list(first_state.cols), list(first_state.waste), first_state.stock_remaining,
-            first_state.stock_total, first_state.found_dict(), time_limit=allowed
+            first_state.stock_total, first_state.found_dict(), time_limit=allowed,
+            initial_stock=first_state.stock,
         )
         if path and solved:
             print('Found full solution after move', m)

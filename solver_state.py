@@ -13,7 +13,7 @@ color evidence is mixed, and those cards must become truncation points, not
 solver cards.
 """
 
-from freecell_solver import rank_val, UNKNOWN, RANK_ORDER
+from freecell_solver import rank_val, UNKNOWN, RANK_ORDER, can_stack
 
 VALID_SUITS = ("S", "H", "D", "C")
 RED_SUITS = ("H", "D")
@@ -186,6 +186,51 @@ def build_solver_state(board, stock_total=24):
         slot_idx, _card = by_suit.pop(suit)
         foundation_reads[slot_idx] = "unreliable"
         del found[suit]
+
+    # A plausible count is not enough: the deck contains each identity once.
+    # Neither duplicate read wins on score alone. If exactly the reads that
+    # break their own column's alternating-descending sequence can be told
+    # apart from the ones that fit, only the breaking reads are blocked;
+    # otherwise every conflicting read is blocked (with any tableau run
+    # depending on it), preserving their slots.
+    def breaks_column(ci, row, identity):
+        if ci >= 7:
+            return False  # waste has no neighbours to check against
+        col = cols[ci]
+        above = col[row - 1] if row > 0 else UNKNOWN
+        below = col[row + 1] if row + 1 < len(col) else UNKNOWN
+        return ((above != UNKNOWN and not can_stack(identity, above))
+                or (below != UNKNOWN and not can_stack(below, identity)))
+
+    locations = {}
+    for ci, pile in enumerate(cols + [waste]):
+        for row, identity in enumerate(pile):
+            if identity != UNKNOWN:
+                locations.setdefault(identity, []).append((ci, row))
+    for identity, duplicates in locations.items():
+        if len(duplicates) < 2:
+            continue
+        labels = [f"col{ci} row {row}" if ci < 7 else f"waste row {row}"
+                  for ci, row in duplicates]
+        broken = [(ci, row) for ci, row in duplicates if breaks_column(ci, row, identity)]
+        if broken and len(broken) < len(duplicates):
+            blocked = broken
+            kept = [l for (loc, l) in zip(duplicates, labels) if loc not in broken]
+            issues.append(f"duplicate card {identity[0]}{identity[1]} at "
+                          f"{', '.join(labels)}; keeping the read that fits its column "
+                          f"({', '.join(kept)}) and treating the rest as unknown")
+        else:
+            blocked = duplicates
+            issues.append(f"duplicate card {identity[0]}{identity[1]} at "
+                          f"{', '.join(labels)}; treating conflicting reads as unknown")
+        for ci, row in blocked:
+            if ci < 7:
+                cols[ci][row:] = [UNKNOWN] * (len(cols[ci]) - row)
+                if ci not in truncated_columns:
+                    truncated_columns.append(ci)
+            else:
+                waste[row] = UNKNOWN
+    truncated_columns.sort()
 
     # Every real card is in exactly one of: a column (revealed or face-down),
     # the waste, a foundation, or undrawn stock - so stock is the remainder.
