@@ -61,7 +61,7 @@ python3 solitaire_auto_bot.py
 ```
 This will loop continuously: capture screen -> analyze state -> compute moves -> execute gesture -> wait for UI update.
 
-For initial device verification, use `--moves-per-cycle 1` to read the board after each move. The default batches up to 5 moves using a predicted layout between screenshots.
+For initial device verification, use `--moves-per-cycle 1` to read the board after each move. The calibrated default batches up to 12 moves using a predicted layout between screenshots.
 
 On ADB, live capture uses a native-size 720×1600, 20 Mbps H.264 screen stream
 decoded by `ffmpeg` in a background worker during OCR, planning, and gestures.
@@ -74,9 +74,9 @@ for this ADB capture path. Other backends retain their screenshot capture.
 This reduces animation misreads but does not eliminate recognition errors
 on a stable frame. Routine captures stay in memory; `--save-screenshots`
 saves accepted frames and `--debug-draws` saves selected diagnostic frames.
-`--fast` uses a 0.05-second pause between batches, preserves the reliable
-720–860 ms drag duration, and relies on the frame check to wait for animations.
-`--interval 0` removes that fixed pause and waits only for a fresh settled frame.
+The calibrated competitive default uses no fixed pause, exact coordinates,
+and fixed 250 ms drags. `--human` restores coordinate jitter, 720–860 ms drags,
+and randomized human-like pauses. The frame check still waits for animations.
 Frame sequence, age, wait time, and motion fraction are recorded in the session log.
 
 Race mode is now the default for the timed game. Explicit `search` and

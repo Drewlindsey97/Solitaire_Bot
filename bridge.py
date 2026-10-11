@@ -21,8 +21,11 @@ BASE_URL = "http://localhost:8080"
 #   "INTENT_ONLY" - Direct Tasker intent broadcasts (useful for AutoInput integration).
 RUN_MODE = "HTTP_BRIDGE"
 
-# Enable/disable human-like automation properties (jitter, duration variations)
-HUMAN_MODE = True
+# Exact coordinates and fixed timing are the calibrated competitive default.
+# Live A/B runs on the Galaxy A21 verified 250ms drags (including multi-card
+# runs) when coordinate jitter was disabled. --human opts back into jitter and
+# timing variation when a human-looking cadence matters more than speed.
+HUMAN_MODE = False
 
 # Jitter config: standard deviation in pixels for target clicks
 TAP_JITTER_RADIUS = 6
@@ -32,10 +35,11 @@ SWIPE_JITTER_RADIUS = 15
 #
 # Two independent knobs, previously conflated:
 #
-# 1. Swipe DURATION (SWIPE_MS_*): how long the drag itself takes. This is
-#    load-bearing - a swipe much faster than ~700ms registers as a fling,
-#    not a card drag, and the game rejects it. Lower it only with live
-#    verification (watch for "Board unchanged after attempting" warnings).
+# 1. Swipe DURATION (SWIPE_MS_*): how long the drag itself takes. Controlled
+#    live calibration on 2026-10-10 isolated duration from coordinate jitter
+#    and verified exact 250ms drags on four of four attempts, including long
+#    multi-card runs. Earlier failures attributed to a ~700ms fling threshold
+#    were therefore alignment/state failures, not a demonstrated speed limit.
 #
 # 2. Inter-gesture PAUSE (POST_TAP_S / POST_SWIPE_S): a blind sleep AFTER
 #    the gesture's own blocking input event has already completed. This was
@@ -49,16 +53,9 @@ SWIPE_JITTER_RADIUS = 15
 #    swipes are seen snapping back before the next gesture (set via
 #    --gesture-delay). HUMAN_PACING restores the old randomized profile for
 #    stealth runs (see --human).
-# Swipe duration is randomized per gesture (randint across this range), so
-# no two drags fire at exactly the same speed - varied cadence both reads
-# as human and avoids a fixed fingerprint. The 560-780 range previously used
-# here was not comfortably above the ~700ms fling threshold: a live run on
-# 2026-10-06 saw repeated "Board unchanged after attempting" failures on the
-# same move at 754ms, 760ms, and 636ms, stalling the bot via max-stuck-cycles.
-# Raised so the floor clears 700ms with margin; lower it again only with live
-# verification (watch for "Board unchanged after attempting" warnings that
-# mean a swipe flung instead of dragged).
-SWIPE_MS_MIN, SWIPE_MS_MAX = 720, 860
+# Competitive mode uses fixed timing and exact coordinates. Human mode opts
+# back into randomized duration and coordinate jitter.
+SWIPE_MS_MIN, SWIPE_MS_MAX = 250, 250
 POST_TAP_S = 0.0
 POST_SWIPE_S = 0.0
 HUMAN_PACING = False
@@ -69,17 +66,18 @@ SCAN_PAUSE_CHANCE = 0.05
 
 def configure_timing(swipe_ms=None, delay_min=None, delay_max=None,
                      scan_pause_chance=None, post_tap=None, post_swipe=None,
-                     human_pacing=None):
+                     human_pacing=None, human_mode=None):
     """Override gesture pacing at runtime (used by the bot's --fast /
     --swipe-ms / --gesture-delay / --human flags)."""
     global SWIPE_MS_MIN, SWIPE_MS_MAX, DELAY_MIN_S, DELAY_MAX_S, SCAN_PAUSE_CHANCE
-    global POST_TAP_S, POST_SWIPE_S, HUMAN_PACING
+    global POST_TAP_S, POST_SWIPE_S, HUMAN_PACING, HUMAN_MODE
     if swipe_ms is not None:
-        # keep the human-mode randomness as a ~±12% spread around the request
-        spread = max(1, swipe_ms // 8)
-        # The game silently rejects fast swipes as flings. Keep explicit
-        # overrides (including --swipe-ms) above the live-verified threshold.
-        SWIPE_MS_MIN, SWIPE_MS_MAX = max(720, swipe_ms - spread), swipe_ms + spread
+        if HUMAN_MODE:
+            # Human mode keeps a ~±12% duration spread.
+            spread = max(1, swipe_ms // 8)
+            SWIPE_MS_MIN, SWIPE_MS_MAX = swipe_ms - spread, swipe_ms + spread
+        else:
+            SWIPE_MS_MIN = SWIPE_MS_MAX = swipe_ms
     if delay_min is not None:
         DELAY_MIN_S = delay_min
     if delay_max is not None:
@@ -92,6 +90,8 @@ def configure_timing(swipe_ms=None, delay_min=None, delay_max=None,
         POST_SWIPE_S = post_swipe
     if human_pacing is not None:
         HUMAN_PACING = human_pacing
+    if human_mode is not None:
+        HUMAN_MODE = human_mode
 
 # Detect if the runtime environment is Android (Pydroid 3, Termux, etc.)
 IS_ANDROID = os.path.exists("/system/bin/app_process") or "ANDROID_ROOT" in os.environ
@@ -305,15 +305,24 @@ def tap(x, y):
         time.sleep(POST_TAP_S)
 
 
-def swipe(x1, y1, x2, y2):
-    """Executes a swipe action. Applies path coordinate jitter and random swipe durations."""
-    jx1 = apply_jitter(x1, SWIPE_JITTER_RADIUS) if HUMAN_MODE else x1
-    jy1 = apply_jitter(y1, SWIPE_JITTER_RADIUS) if HUMAN_MODE else y1
-    jx2 = apply_jitter(x2, SWIPE_JITTER_RADIUS) if HUMAN_MODE else x2
-    jy2 = apply_jitter(y2, SWIPE_JITTER_RADIUS) if HUMAN_MODE else y2
+def swipe(x1, y1, x2, y2, duration_ms=None, jitter=None):
+    """Execute a swipe, optionally with an exact duration/jitter policy.
 
-    duration_ms = random.randint(SWIPE_MS_MIN, SWIPE_MS_MAX) if HUMAN_MODE \
-        else (SWIPE_MS_MIN + SWIPE_MS_MAX) // 2
+    The overrides are used by live calibration so swipe duration can be
+    isolated from random coordinate variation. Existing callers retain the
+    normal humanized timing and jitter.
+    """
+    use_jitter = HUMAN_MODE if jitter is None else jitter
+    jx1 = apply_jitter(x1, SWIPE_JITTER_RADIUS) if use_jitter else x1
+    jy1 = apply_jitter(y1, SWIPE_JITTER_RADIUS) if use_jitter else y1
+    jx2 = apply_jitter(x2, SWIPE_JITTER_RADIUS) if use_jitter else x2
+    jy2 = apply_jitter(y2, SWIPE_JITTER_RADIUS) if use_jitter else y2
+
+    if duration_ms is None:
+        duration_ms = random.randint(SWIPE_MS_MIN, SWIPE_MS_MAX) if HUMAN_MODE \
+            else (SWIPE_MS_MIN + SWIPE_MS_MAX) // 2
+    else:
+        duration_ms = int(duration_ms)
 
     if RUN_MODE == "HTTP_BRIDGE":
         print(f"Swipe from ({jx1}, {jy1}) to ({jx2}, {jy2}) via HTTP")

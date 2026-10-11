@@ -275,7 +275,8 @@ def foundation_card_below(card):
 # ==============================================================================
 # 3. MOVE TRANSLATION TO PHYSICAL GESTURES
 # ==============================================================================
-def execute_move(board, move, sim_mode=False, event_logger=None):
+def execute_move(board, move, sim_mode=False, event_logger=None,
+                 swipe_duration_ms=None, swipe_jitter=None):
     """
     Translates a solver move into coordinates and triggers the swipe/tap.
     """
@@ -433,12 +434,18 @@ def execute_move(board, move, sim_mode=False, event_logger=None):
                 gesture="swipe",
                 start={"x": x1, "y": y1},
                 end={"x": x2, "y": y2},
+                duration_ms=swipe_duration_ms,
+                jitter=swipe_jitter,
                 simulation=sim_mode,
             )
             if sim_mode:
                 print(f"   [Simulation] Would swipe: bridge.swipe({x1}, {y1}, {x2}, {y2})")
             else:
-                bridge.swipe(x1, y1, x2, y2)
+                bridge.swipe(
+                    x1, y1, x2, y2,
+                    duration_ms=swipe_duration_ms,
+                    jitter=swipe_jitter,
+                )
         emit("gesture_dispatched", move=move, simulation=sim_mode)
         return True
     else:
@@ -592,32 +599,32 @@ def parse_args(argv=None):
     parser.add_argument(
         "--moves-per-cycle",
         type=int,
-        default=5,
+        default=12,
         help="Max solved moves to execute before re-capturing the screen and re-solving "
              "(0 = execute the entire computed path in one go). Between moves in a batch "
              "we update our local board model instead of re-reading the screen, so higher "
              "values are faster but rely on the physical game matching our model exactly; "
-             "lower values re-verify against a fresh screenshot more often. Default: 5.",
+             "lower values re-verify against a fresh screenshot more often. Default: 12.",
     )
     parser.add_argument(
         "--interval",
         type=float,
         default=None,
         help="Seconds to wait after a batch of moves for the UI to settle before the next "
-             "screen capture. Default: 1.0 (0.05 with --fast). "
+             "screen capture. Default: 0. "
              "Consecutive captures must also agree before card reading.",
     )
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Use a 0.05s capture interval and consecutive settled frames, "
-             "preserving the reliable 720-860ms drags.",
+        help="Use the calibrated competitive profile (currently also the default): "
+             "zero interval, exact coordinates, and fixed 250ms drags.",
     )
     parser.add_argument(
         "--human",
         action="store_true",
-        help="Restore the old human-like stealth pacing (0.9-1.5s randomized pause "
-             "after every gesture, occasional longer scan pauses). Much slower; use "
+        help="Restore human-like coordinate jitter, 720-860ms drags, and a "
+             "0.9-1.5s randomized pause after every gesture. Much slower; use "
              "only when mimicking a human cadence matters more than speed.",
     )
     parser.add_argument(
@@ -649,9 +656,21 @@ def parse_args(argv=None):
         "--swipe-ms",
         type=int,
         default=None,
-        help="Swipe gesture duration in milliseconds. Default: 720-860, including --fast. "
-             "Swipes much faster than ~700ms were observed not registering as drags; "
-             "500 needs on-device verification.",
+        help="Fixed swipe duration in milliseconds for the competitive profile. "
+             "Default: 250, verified live with exact coordinates.",
+    )
+    parser.add_argument(
+        "--calibrate-swipes",
+        action="store_true",
+        help="Run one move per read, disable swipe-coordinate jitter, and "
+             "measure exact swipe durations. A failed swipe is retried on "
+             "the unchanged board at the next duration.",
+    )
+    parser.add_argument(
+        "--calibration-durations",
+        default="450,550,650,750",
+        help="Comma-separated swipe durations in milliseconds for "
+             "--calibrate-swipes. Default: 450,550,650,750.",
     )
     parser.add_argument(
         "--gesture-delay",
@@ -719,19 +738,34 @@ def parse_args(argv=None):
         parser.error("--solver-time-limit must be a finite positive number")
     if args.swipe_ms is not None and args.swipe_ms <= 0:
         parser.error("--swipe-ms must be positive")
+    try:
+        args.calibration_durations = tuple(
+            int(value.strip()) for value in args.calibration_durations.split(",")
+            if value.strip()
+        )
+    except ValueError:
+        parser.error("--calibration-durations must be comma-separated integers")
+    if not args.calibration_durations or any(value <= 0 for value in args.calibration_durations):
+        parser.error("--calibration-durations must contain positive integers")
     return args
 
 
 def main():
     args = parse_args()
 
+    if args.calibrate_swipes:
+        # A fresh read after every move is what makes the result attributable
+        # to one exact swipe. Random coordinate jitter is disabled at dispatch.
+        args.moves_per_cycle = 1
+        args.solver = "race"
+        args.interval = 0.0
+
     if args.interval is None:
-        args.interval = (0.05 if args.fast else 1.0)
+        args.interval = 0.0
     if args.human:
-        # Opt back into the slow stealth cadence: randomized pause after
-        # every gesture. Overrides the default no-pause competitive path.
-        args.interval = args.interval if args.interval is not None else 1.5
-        bridge.configure_timing(human_pacing=True)
+        # Opt back into the old slow, randomized profile.
+        bridge.configure_timing(human_mode=True, human_pacing=True)
+        bridge.SWIPE_MS_MIN, bridge.SWIPE_MS_MAX = 720, 860
     if args.swipe_ms is not None:
         bridge.configure_timing(swipe_ms=args.swipe_ms)
     if args.gesture_delay is not None:
@@ -745,6 +779,9 @@ def main():
     # Enabling logcat also enables a structured session log unless the user
     # already supplied an explicit JSONL path.
     session_log_path = Path(args.log_file) if args.log_file else None
+    if args.calibrate_swipes and session_log_path is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_log_path = Path("logs") / f"swipe_calibration_{stamp}.jsonl"
     if args.logcat and session_log_path is None:
         session_log_path = default_session_log_path()
 
@@ -787,6 +824,13 @@ def main():
     previous_solver_signature = None
     previous_first_move = None
     excluded_first_moves = set()
+    calibration_duration_index = 0
+    calibration_retry_move = None
+    previous_calibration_attempt = None
+    calibration_results = []
+    if args.calibrate_swipes:
+        print("[*] SWIPE CALIBRATION mode: one move per read, exact coordinates, "
+              f"durations={args.calibration_durations}ms")
     # A move that fails once might just be a one-off flaky gesture, worth
     # retrying later - but a move that keeps failing repeatedly from the
     # SAME board state (some specific source/destination pairing the
@@ -1154,15 +1198,56 @@ def main():
                 tuple(tuple(c) for c in cols), tuple(waste),
                 tuple(sorted(found.items())), stock_remaining,
             )
-            if ((args.solver == "search" or (args.solver == "race" and track_move_failures))
-                    and previous_first_move is not None
-                    and current_solver_signature == previous_solver_signature):
-                print(f"[Warn] Board unchanged after attempting {previous_first_move}; "
-                      f"excluding it and re-solving.")
-                log_event("move_stuck_excluding", cycle=cycle_number, move=previous_first_move)
-                excluded_first_moves.add(previous_first_move)
+            unchanged_attempt = (
+                (args.solver == "search" or (args.solver == "race" and track_move_failures))
+                and previous_first_move is not None
+                and current_solver_signature == previous_solver_signature
+            )
+            calibration_retrying = False
+            if previous_calibration_attempt is not None:
+                succeeded = not unchanged_attempt
+                result = {
+                    **previous_calibration_attempt,
+                    "success": succeeded,
+                    "cycle_verified": cycle_number,
+                }
+                calibration_results.append(result)
+                status = "PASS" if succeeded else "FAIL"
+                print(f"[Calibration] {status}: {result['duration_ms']}ms "
+                      f"for {result['move']}")
+                log_event("swipe_calibration_result", **result)
 
-                if track_move_failures:
+                if succeeded:
+                    calibration_duration_index = (
+                        calibration_duration_index + 1
+                    ) % len(args.calibration_durations)
+                    calibration_retry_move = None
+                elif calibration_duration_index + 1 < len(args.calibration_durations):
+                    calibration_duration_index += 1
+                    calibration_retry_move = previous_calibration_attempt["move"]
+                    calibration_retrying = True
+                    next_ms = args.calibration_durations[calibration_duration_index]
+                    print(f"[Calibration] Board unchanged; retrying the same move "
+                          f"at {next_ms}ms.")
+                else:
+                    calibration_duration_index = 0
+                    calibration_retry_move = None
+                    print("[Calibration] All durations failed for the same move; "
+                          "treating this as an alignment/state failure, not a speed result.")
+                previous_calibration_attempt = None
+
+            if unchanged_attempt:
+                if calibration_retrying:
+                    # Keep the same move eligible so duration is the only
+                    # changed variable on the next attempt.
+                    excluded_first_moves = set()
+                else:
+                    print(f"[Warn] Board unchanged after attempting {previous_first_move}; "
+                          f"excluding it and re-solving.")
+                    log_event("move_stuck_excluding", cycle=cycle_number, move=previous_first_move)
+                    excluded_first_moves.add(previous_first_move)
+
+                if track_move_failures and not calibration_retrying:
                     failure_key = (previous_solver_signature, previous_first_move)
                     fail_count = move_failure_counts.get(failure_key, 0) + 1
                     move_failure_counts[failure_key] = fail_count
@@ -1220,6 +1305,11 @@ def main():
                     # stalled; then bank cards before the clock runs out.
                     endgame=cycles_without_progress < ENDGAME_DOCK_AFTER_CYCLES,
                 )
+                if args.calibrate_swipes and calibration_retry_move is not None:
+                    # The verified board is unchanged, so replay the identical
+                    # legal move with only duration changed.
+                    batch = [calibration_retry_move]
+                    calibration_retry_move = None
                 track_move_failures = len(batch) == 1
                 solver_seconds = time.perf_counter() - solver_started
 
@@ -1271,9 +1361,22 @@ def main():
                     fan_count = len(board["waste"])
                     for idx, move in enumerate(batch):
                         print(f"  {idx + 1}. {move}")
+                        is_swipe = move[0] in ("col_to_col", "waste_to_col", "found_to_col")
+                        calibration_duration = (
+                            args.calibration_durations[calibration_duration_index]
+                            if args.calibrate_swipes and is_swipe else None
+                        )
                         ok = execute_move(
                             board, move, sim_mode=sim_mode, event_logger=log_event,
+                            swipe_duration_ms=calibration_duration,
+                            swipe_jitter=False if calibration_duration is not None else None,
                         )
+                        if ok and calibration_duration is not None:
+                            previous_calibration_attempt = {
+                                "move": move,
+                                "duration_ms": calibration_duration,
+                                "cycle_attempted": cycle_number,
+                            }
                         if ok:
                             stock_history.record_move(move)
                         if ok and move[0] in ("col_to_found", "waste_to_found"):
@@ -1525,6 +1628,13 @@ def main():
         print("\n[*] Interrupted by user. Shutting down cleanly...")
         log_event("session_interrupted", cycle=cycle_number)
     finally:
+        if args.calibrate_swipes:
+            print("[*] Swipe calibration summary:")
+            for duration in args.calibration_durations:
+                samples = [r for r in calibration_results if r["duration_ms"] == duration]
+                passes = sum(1 for r in samples if r["success"])
+                print(f"  {duration}ms: {passes}/{len(samples)} passed")
+            log_event("swipe_calibration_summary", results=calibration_results)
         if capture_worker is not None:
             capture_worker.stop()
         if logcat_monitor is not None:
