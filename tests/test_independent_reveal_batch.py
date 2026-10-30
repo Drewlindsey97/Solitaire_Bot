@@ -30,3 +30,14 @@ def test_batch_limit_still_applies_to_independent_reveals():
     state = State([[UNKNOWN, ('A', 'H')], [UNKNOWN, ('A', 'S')]] + [[]] * 5,
                   [], 24, 24, {})
     assert len(plan_batch(state, max_moves=1)) == 1
+
+
+def test_competing_reveals_dig_the_column_with_more_face_down_cards():
+    # Both black nines want the only red ten. Column 0 is longer but hides
+    # one card; column 1 hides two, so it is the better place to dig.
+    state = State([[UNKNOWN, ('9', 'S'), ('8', 'H'), ('7', 'C')],
+                   [UNKNOWN, UNKNOWN, ('9', 'C')],
+                   [('10', 'D')], [], [], [], []],
+                  [], 24, 24, {})
+    from race_policy import choose_move
+    assert choose_move(state) == ('col_to_col', 1, 2, ('9', 'C'), 1)

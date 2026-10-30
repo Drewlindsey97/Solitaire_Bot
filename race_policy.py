@@ -120,8 +120,11 @@ def score_move(state, move):
         _, ci, cj, card, run_length = move
         col = state.cols[ci]
         if _col_reveals(col, run_length):
-            # Deeper stacks are worth more: they unlock more of the board.
-            return SCORE_REVEAL + min(len(col), 12)
+            # Prefer the column with the most face-down cards left: digging
+            # there unlocks the most of the board. (Ranking by total column
+            # length, face-up cards included, won 8-14 fewer games per 2000
+            # simulated deals.)
+            return SCORE_REVEAL + 10 * sum(1 for c in col if c == UNKNOWN)
         if _gains_empty_column(state, move):
             return SCORE_EMPTY_COLUMN
         # Neither reveals a card nor gains an empty column: pure relocation
@@ -135,7 +138,7 @@ def score_move(state, move):
     return 0
 
 
-def _move_gain(state, move, after):
+def _move_gain(state, move, after, defer=False):
     """Progress a single move makes, for lookahead accounting (0 = none).
 
     `after` is the already-simulated result of applying `move` to `state`:
@@ -145,6 +148,8 @@ def _move_gain(state, move, after):
     empty-column credit when founding a column's last card.
     """
     kind = move[0]
+    if defer and _plain_docking(state, move):
+        return 0  # held back (deferred docking): no reason to set it up
     if kind in ("col_to_found", "waste_to_found"):
         g = GAIN_FOUNDATION
         if kind == "col_to_found":
@@ -163,7 +168,7 @@ def _move_gain(state, move, after):
     return 0
 
 
-def _reachable_gain(state, depth, seen):
+def _reachable_gain(state, depth, seen, defer=False):
     """Best total progress (founds + reveals + empties) reachable within `depth`
     plies over known cards. Draw/redeal are not simulated (they turn over cards
     we can't see). A visited-set prevents the relocation shuffles from looping
@@ -185,8 +190,8 @@ def _reachable_gain(state, depth, seen):
         # GAIN_STEP charges each ply, so equal raw gains rank by how soon
         # they arrive (see the constant's comment). The floor of 0 ("stop
         # here") keeps gainless tails from dragging a real gain negative.
-        val = (_move_gain(state, m, ns) - GAIN_STEP
-               + _reachable_gain(ns, depth - 1, seen))
+        val = (_move_gain(state, m, ns, defer) - GAIN_STEP
+               + _reachable_gain(ns, depth - 1, seen, defer))
         seen.discard(k)
         if val > best:
             best = val
@@ -360,8 +365,9 @@ def _legal_dockings(state):
             if col and can_found(col[-1], found)]
 
 
-def _first_enabling_move(state, candidates):
-    """First move of the shortest line that makes the waste card playable.
+def _first_enabling_move(state, candidates, goal=_waste_playable):
+    """First move of the shortest line that reaches `goal` (by default: the
+    waste card becomes playable).
 
     The line starts with one of `candidates` and continues with dockings
     only. Dockings only ever raise the foundations, so the search cannot
@@ -374,7 +380,7 @@ def _first_enabling_move(state, candidates):
             nxt = apply_move(state, m)
         except Exception:
             continue
-        if _waste_playable(nxt):
+        if goal(nxt):
             return m
         if nxt.key() not in seen:
             seen.add(nxt.key())
@@ -384,7 +390,7 @@ def _first_enabling_move(state, candidates):
         for sim, first in frontier:
             for d in _legal_dockings(sim):
                 after = apply_move(sim, d)
-                if _waste_playable(after):
+                if goal(after):
                     return first
                 if after.key() not in seen:
                     seen.add(after.key())
@@ -423,6 +429,65 @@ def _choose_endgame(state, exclude, pulldown_or):
     return pulldown_or(stock[0] if stock else None)
 
 
+# ------------------------------------------------------------------------------
+# Deferred docking (user report 2026-10-16): with face-down cards still on the
+# board the policy used to dock every eligible tableau card in rank order -
+# one live batch spent 12 taps banking 3S..9D while 3 cards sat face down and
+# the stock still held cards. The game docks everything itself once the board
+# is face up and the draw pile is empty, so those taps were clock spent on
+# work auto-complete does for free, and docking can take away a landing spot
+# a waste card needed. So a "plain" docking - one that reveals nothing and
+# empties no column - is held back. It is played only when a short docking
+# chain opens the waste card or a reveal/empty-column move, or when nothing
+# but dead shuffles remains with the draw pile exhausted. The caller's stall
+# fallback (endgame=False) restores eager docking so an unwinnable round
+# still banks its cards before the clock runs out.
+
+
+DEFER_DOCKING = False  # off: cost wins in simulation (2026-10-16), see section comment
+# Hold dockings back only this close to the end (face-down cards left).
+DEFER_DOCKING_MAX_HIDDEN = 4
+
+
+def _defer_docking(state, endgame):
+    return (endgame and DEFER_DOCKING
+            and sum(c == UNKNOWN for col in state.cols for c in col) <= DEFER_DOCKING_MAX_HIDDEN)
+
+
+def _plain_docking(state, move):
+    """A docking only auto-complete needs: it reveals nothing, empties no
+    column, and the next card of its suit already sits face up on the
+    tableau - so banking it now cannot let a draw-pile or face-down card go
+    up. (Holding back every non-revealing docking, low cards included, cost
+    ~12% of wins in simulation: waste cards lost their foundation home.)"""
+    if move[0] != "col_to_found":
+        return False
+    col = state.cols[move[1]]
+    if _col_reveals(col, 1) or _empties_column(col, 1):
+        return False
+    rank, suit = move[2]
+    i = RANK_ORDER.index(rank)
+    if i + 1 >= len(RANK_ORDER):
+        return True  # a King: nothing builds on it
+    nxt = (RANK_ORDER[i + 1], suit)
+    return any(nxt in c for c in state.cols)
+
+
+def _opens_progress(state):
+    """Waste card playable, or a tableau move that reveals or empties a column."""
+    if _waste_playable(state):
+        return True
+    for m in generate_moves(state):
+        if m[0] == "col_to_found":
+            col = state.cols[m[1]]
+            if _col_reveals(col, 1) or _empties_column(col, 1):
+                return True
+        elif m[0] == "col_to_col":
+            if _col_reveals(state.cols[m[1]], m[4]) or _gains_empty_column(state, m):
+                return True
+    return False
+
+
 def choose_move(state, exclude=None, allow_null_shuffle=False,
                 lookahead_depth=LOOKAHEAD_DEPTH, pulled_down=None, endgame=True):
     """Best single move for the clock, or None if nothing is worth doing.
@@ -458,27 +523,37 @@ def choose_move(state, exclude=None, allow_null_shuffle=False,
     # setup relocations cost ~1.6 banked cards per game).
     stock_moves = [m for m in moves if m[0] in ("draw", "redeal")]
     moves = [m for m in moves if m[0] not in ("draw", "redeal")]
-    if not moves:
+    # Deferred docking (see section above): only while endgame is on, i.e.
+    # until the caller's stall fallback asks for cards to be banked.
+    held = [m for m in moves if _plain_docking(state, m)] if _defer_docking(state, endgame) else []
+    if held:
+        moves = [m for m in moves if m not in held]
+        held.sort(key=lambda m: rank_val(m[2][0]))
+    if not moves and not held:
         return pulldown_or(stock_moves[0])
-    scored = [(score_move(state, m), m) for m in moves]
-    scored.sort(key=lambda sm: sm[0], reverse=True)
-    best_score, best_move = scored[0]
-    if best_score > SCORE_NULL_SHUFFLE / 2 or allow_null_shuffle:
-        return best_move
+    scored = sorted(((score_move(state, m), m) for m in moves),
+                    key=lambda sm: sm[0], reverse=True)
+    if scored and (scored[0][0] > SCORE_NULL_SHUFFLE / 2 or allow_null_shuffle):
+        return scored[0][1]
+    if held:
+        first = _first_enabling_move(state, held, goal=_opens_progress)
+        if first is not None:
+            return first
 
     # Everything legal is a bare relocation. Before drawing past the position,
     # check whether any of these relocations is actually a setup that leads to
     # a foundation or reveal within a few plies. If so, take the one that
     # unblocks the most - this is what lets the endgame progress instead of
     # freezing (previously it drew here and spun until the clock ran out).
-    if lookahead_depth > 0:
+    if lookahead_depth > 0 and scored:
         best_setup, best_gain = None, 0
         for _score, m in scored:
             try:
                 ns = apply_move(state, m)
             except Exception:
                 continue
-            gain = _reachable_gain(ns, lookahead_depth - 1, {state.key(), ns.key()})
+            gain = _reachable_gain(ns, lookahead_depth - 1, {state.key(), ns.key()},
+                                   defer=_defer_docking(state, endgame))
             if gain > best_gain:
                 best_gain, best_setup = gain, m
         if best_setup is not None:
@@ -492,6 +567,9 @@ def choose_move(state, exclude=None, allow_null_shuffle=False,
         return pulldown_or(("draw",))
     if state.stock_total > 0 and state.waste:
         return pulldown_or(("redeal",))
+    # Draw pile exhausted: bank a held card rather than stall.
+    if held:
+        return pulldown_or(held[0])
     # No stock left and only dead shuffles remain: genuinely stuck.
     return pulldown_or(None)
 

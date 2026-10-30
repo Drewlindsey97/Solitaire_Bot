@@ -892,6 +892,11 @@ def main():
     cycles_without_progress = 0
     previous_issue_signature = None
     nongameplay_frames = 0
+    nongameplay_reason = None
+    # A post-game screen often keeps animating, so no settled frame ever
+    # arrives and each wait times out (4s). Live 2026-10-10 one session sat
+    # through 68 such timeouts (~4.5 min) after the round ended.
+    capture_failures_after_nongameplay = 0
     capture_worker = None
     frame_sequence = 0
     stock_history = StockHistory(STOCK_TOTAL)
@@ -968,14 +973,24 @@ def main():
                         cycle=cycle_number,
                         duration_seconds=capture_seconds,
                     )
+                    if nongameplay_frames:
+                        capture_failures_after_nongameplay += 1
+                        if capture_failures_after_nongameplay >= 2:
+                            print(f"[*] Stopping: {nongameplay_reason} (screen still animating). "
+                                  "No further game inputs sent.")
+                            log_event("session_screen_stop", reason=nongameplay_reason,
+                                      capture_failures=capture_failures_after_nongameplay)
+                            break
                     time.sleep(0.15)
                     continue
+                capture_failures_after_nongameplay = 0
 
             if not sim_mode:
                 frame_bgr = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
                 reason = gameplay_screen_reason(frame_bgr)
                 if reason:
                     nongameplay_frames += 1
+                    nongameplay_reason = reason
                     log_event("nongameplay_screen", cycle=cycle_number, reason=reason,
                               consecutive=nongameplay_frames)
                     if nongameplay_frames >= 3:
