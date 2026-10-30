@@ -223,7 +223,7 @@ ENDGAME_DOCK_AFTER_CYCLES = 8
 WASTE_FAN_X = (428, 472, 514)
 # Pause after a mid-batch stock tap so the draw animation lands before the
 # next gesture touches the waste. Far shorter than a full capture cycle.
-MID_BATCH_DRAW_SETTLE_SECONDS = 0.35
+MID_BATCH_DRAW_SETTLE_SECONDS = 0.22
 
 
 def next_fan_count(fan_count, move, after):

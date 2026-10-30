@@ -52,3 +52,14 @@ def test_rejected_waste_move_is_not_repeated():
     batch = plan_batch(state, max_moves=5, exclude={rejected})
     assert rejected not in batch
     assert batch == [("draw",)]
+
+
+def test_waste_play_enabling_reveal_is_prioritized_and_chained():
+    # Waste has 9S, Col 0 has 10H, Col 1 has [UNKNOWN, 8D].
+    # Playing 9S to 10H enables 8D to move onto 9S, uncovering the face-down card.
+    # With confirmed card under 9S, both moves chain in the same batch.
+    unknown = ("?", "?")
+    cols = [[("10", "H")], [unknown, ("8", "D")]] + [[] for _ in range(5)]
+    state = State(cols, [("K", "C"), ("9", "S")], 20, 24, {})
+    batch = plan_batch(state, max_moves=5)
+    assert batch[:2] == [("waste_to_col", 0, ("9", "S")), ("col_to_col", 1, 0, ("8", "D"), 1)]

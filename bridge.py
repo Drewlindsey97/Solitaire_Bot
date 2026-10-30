@@ -7,6 +7,8 @@ import subprocess
 import shlex
 import struct
 import requests
+import threading
+import atexit
 
 # ==============================================================================
 # 1. CONFIGURATION
@@ -55,7 +57,7 @@ SWIPE_JITTER_RADIUS = 15
 #    stealth runs (see --human).
 # Competitive mode uses fixed timing and exact coordinates. Human mode opts
 # back into randomized duration and coordinate jitter.
-SWIPE_MS_MIN, SWIPE_MS_MAX = 250, 250
+SWIPE_MS_MIN, SWIPE_MS_MAX = 200, 200
 POST_TAP_S = 0.0
 POST_SWIPE_S = 0.0
 HUMAN_PACING = False
@@ -139,6 +141,81 @@ def _adb_prefix():
     if RUN_MODE == "LOCAL_LADB":
         return ["adb", "-s", "localhost:5555"]
     return ["adb"]
+
+_persistent_shell_proc = None
+_persistent_shell_lock = threading.Lock()
+
+def _get_persistent_shell():
+    """Returns a live persistent adb shell process, or None if unavailable."""
+    global _persistent_shell_proc
+    if RUN_MODE not in ("PC_ADB", "LOCAL_LADB"):
+        return None
+    if _persistent_shell_proc is not None:
+        if _persistent_shell_proc.poll() is None:
+            return _persistent_shell_proc
+        _persistent_shell_proc = None
+    try:
+        cmd = _adb_prefix() + ["shell"]
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        proc.stdin.write("echo __READY__\n")
+        proc.stdin.flush()
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                return None
+            if "__READY__" in line:
+                break
+        _persistent_shell_proc = proc
+        return _persistent_shell_proc
+    except Exception:
+        _persistent_shell_proc = None
+        return None
+
+def _close_persistent_shell():
+    global _persistent_shell_proc
+    with _persistent_shell_lock:
+        if _persistent_shell_proc is not None:
+            try:
+                _persistent_shell_proc.terminate()
+                _persistent_shell_proc.wait(timeout=1)
+            except Exception:
+                try:
+                    _persistent_shell_proc.kill()
+                except Exception:
+                    pass
+            _persistent_shell_proc = None
+
+atexit.register(_close_persistent_shell)
+
+def run_shell_input(cmd_str):
+    """Executes an input command in Android shell. Uses persistent adb shell if
+    available for ~2x faster dispatch, falling back to run_cmd."""
+    if RUN_MODE in ("PC_ADB", "LOCAL_LADB"):
+        with _persistent_shell_lock:
+            proc = _get_persistent_shell()
+            if proc is not None:
+                try:
+                    proc.stdin.write(f"{cmd_str}; echo __CMD_DONE__$?\n")
+                    proc.stdin.flush()
+                    while True:
+                        line = proc.stdout.readline()
+                        if not line:
+                            _close_persistent_shell()
+                            break
+                        line = line.strip()
+                        if line.startswith("__CMD_DONE__"):
+                            return line[len("__CMD_DONE__"):]
+                except Exception:
+                    _close_persistent_shell()
+    # Fallback to run_cmd
+    return run_cmd(["shell"] + shlex.split(cmd_str))
 
 def decode_raw_screenshot(data):
     """Decode Android's 12/16-byte screencap header; reject malformed frames."""
@@ -280,8 +357,8 @@ def tap(x, y):
     target_x = apply_jitter(x, TAP_JITTER_RADIUS) if HUMAN_MODE else x
     target_y = apply_jitter(y, TAP_JITTER_RADIUS) if HUMAN_MODE else y
     
-    # average human hold duration is 75-125ms
-    hold_duration_ms = random.randint(75, 125) if HUMAN_MODE else 100
+    # average human hold duration is 75-125ms; competitive hold is 50ms
+    hold_duration_ms = random.randint(75, 125) if HUMAN_MODE else 50
 
     if RUN_MODE == "HTTP_BRIDGE":
         print(f"Tap at ({target_x}, {target_y}) via HTTP")
@@ -294,7 +371,7 @@ def tap(x, y):
     else:
         print(f"Tap at ({target_x}, {target_y}) via shell ({RUN_MODE}) for {hold_duration_ms}ms")
         # In Android shell, executing a short swipe on the same coordinate acts as a tap with custom duration
-        run_cmd(["shell", "input", "swipe", str(target_x), str(target_y), str(target_x), str(target_y), str(hold_duration_ms)])
+        run_shell_input(f"input swipe {target_x} {target_y} {target_x} {target_y} {hold_duration_ms}")
 
     # No blind pause on the competitive path: a foundation tap flies to an
     # independent pile and the next cycle re-reads the real board. The old
@@ -339,7 +416,7 @@ def swipe(x1, y1, x2, y2, duration_ms=None, jitter=None):
         trigger_tasker_autoinput("AutoInputSwipe", {"x1": jx1, "y1": jy1, "x2": jx2, "y2": jy2, "duration": duration_ms})
     else:
         print(f"Swipe from ({jx1}, {jy1}) to ({jx2}, {jy2}) via shell ({RUN_MODE}) over {duration_ms}ms")
-        run_cmd(["shell", "input", "swipe", str(jx1), str(jy1), str(jx2), str(jy2), str(duration_ms)])
+        run_shell_input(f"input swipe {jx1} {jy1} {jx2} {jy2} {duration_ms}")
 
     # The drag has physically completed by the time input swipe returns.
     # Competitive default adds no settle; dial POST_SWIPE_S up (--gesture-delay)

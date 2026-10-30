@@ -88,6 +88,26 @@ def _gains_empty_column(state, move):
     return _empty_count(after) > _empty_count(state)
 
 
+def _waste_reveal_gain(state, move):
+    """Return extra score if placing this waste card immediately allows an exposed run
+    in another column to uncover a hidden card (prioritizing deeper face-down stacks)."""
+    _, cj, card = move
+    best_unk = -1
+    for ci, col in enumerate(state.cols):
+        if ci == cj or not col:
+            continue
+        for run_len in range(1, len(col) + 1):
+            if col[-run_len] == UNKNOWN:
+                break
+            if can_stack(col[-run_len], card) and _col_reveals(col, run_len):
+                unk_count = sum(1 for c in col if c == UNKNOWN)
+                if unk_count > best_unk:
+                    best_unk = unk_count
+    if best_unk >= 0:
+        return SCORE_REVEAL + 10 * best_unk
+    return 0
+
+
 def score_move(state, move):
     """Rank one legal move by progress-per-move. Higher is better.
 
@@ -114,7 +134,8 @@ def score_move(state, move):
 
     if kind == "waste_to_col":
         # Always at least mildly useful: the waste only moves forward.
-        return SCORE_WASTE_TO_COL + SCORE_FROM_WASTE_DEPTH
+        # Boost when it immediately unlocks a face-down reveal in the tableau.
+        return SCORE_WASTE_TO_COL + SCORE_FROM_WASTE_DEPTH + _waste_reveal_gain(state, move)
 
     if kind == "col_to_col":
         _, ci, cj, card, run_length = move
