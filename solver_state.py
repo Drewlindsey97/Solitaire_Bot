@@ -244,6 +244,7 @@ def build_solver_state(board, stock_total=24):
             f"impossible stock_remaining={stock_remaining} "
             f"(valid range 0-{stock_total}); some read above is wrong"
         )
+        stock_remaining = max(0, min(stock_total, stock_remaining))
 
     return {
         "cols": cols,

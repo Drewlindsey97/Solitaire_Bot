@@ -618,7 +618,7 @@ def parse_args(argv=None):
         "--fast",
         action="store_true",
         help="Use the calibrated competitive profile (currently also the default): "
-             "zero interval, exact coordinates, and fixed 250ms drags.",
+             "zero interval, exact coordinates, and fixed 180ms drags.",
     )
     parser.add_argument(
         "--human",
@@ -657,7 +657,7 @@ def parse_args(argv=None):
         type=int,
         default=None,
         help="Fixed swipe duration in milliseconds for the competitive profile. "
-             "Default: 250, verified live with exact coordinates.",
+             "Default: 180, verified live with exact coordinates.",
     )
     parser.add_argument(
         "--calibrate-swipes",

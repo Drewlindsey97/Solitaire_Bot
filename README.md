@@ -75,7 +75,7 @@ This reduces animation misreads but does not eliminate recognition errors
 on a stable frame. Routine captures stay in memory; `--save-screenshots`
 saves accepted frames and `--debug-draws` saves selected diagnostic frames.
 The calibrated competitive default uses no fixed pause, exact coordinates,
-and fixed 250 ms drags. `--human` restores coordinate jitter, 720–860 ms drags,
+and fixed 180 ms drags. `--human` restores coordinate jitter, 720–860 ms drags,
 and randomized human-like pauses. The frame check still waits for animations.
 Frame sequence, age, wait time, and motion fraction are recorded in the session log.
 

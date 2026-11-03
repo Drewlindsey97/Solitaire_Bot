@@ -57,7 +57,7 @@ SWIPE_JITTER_RADIUS = 15
 #    stealth runs (see --human).
 # Competitive mode uses fixed timing and exact coordinates. Human mode opts
 # back into randomized duration and coordinate jitter.
-SWIPE_MS_MIN, SWIPE_MS_MAX = 200, 200
+SWIPE_MS_MIN, SWIPE_MS_MAX = 180, 180
 POST_TAP_S = 0.0
 POST_SWIPE_S = 0.0
 HUMAN_PACING = False
