@@ -142,6 +142,54 @@ def _adb_prefix():
         return ["adb", "-s", "localhost:5555"]
     return ["adb"]
 
+# ---------------------------------------------------------------------------
+# minicap streaming capture (opt-in)
+#
+# When enabled, screenshot() returns the newest frame off a continuous minicap
+# stream (30-60 fps while the screen animates) instead of a fresh per-call
+# `screencap` round-trip (~1.5-2 fps). It is strictly additive: if the stream
+# has no frame yet, or is not enabled, capture falls back to screencap.
+# ---------------------------------------------------------------------------
+_minicap = None  # active MinicapStream, or None
+
+def enable_minicap(serial=None, local_port=1313):
+    """Start a minicap stream for the current adb device. Returns the banner
+    dict on success. Safe to call once; raises on setup failure so the caller
+    can decide whether to proceed on screencap alone."""
+    global _minicap
+    if _minicap is not None:
+        return _minicap.banner
+    import minicap_stream
+    prefix = ["adb", "-s", serial] if serial else _adb_prefix()
+    stream = minicap_stream.MinicapStream(adb_prefix=prefix, local_port=local_port)
+    banner = stream.start()
+    _minicap = stream
+    print(f"[*] minicap streaming capture enabled: {banner.get('real_width')}x"
+          f"{banner.get('real_height')} (pid {banner.get('pid')})")
+    return banner
+
+def disable_minicap():
+    global _minicap
+    if _minicap is not None:
+        _minicap.stop()
+        _minicap = None
+
+def minicap_active():
+    return _minicap is not None and _minicap.is_alive()
+
+def _minicap_frame():
+    """Latest minicap frame as a PIL RGB Image, or None if unavailable."""
+    if _minicap is None:
+        return None
+    try:
+        return _minicap.read_latest()
+    except Exception as e:
+        print(f"[Warn] minicap read failed ({e}); falling back to screencap.",
+              file=sys.stderr)
+        return None
+
+atexit.register(disable_minicap)
+
 _persistent_shell_proc = None
 _persistent_shell_lock = threading.Lock()
 
@@ -440,6 +488,11 @@ def screenshot():
             print(f"[Error] Failed to fetch screenshot from HTTP bridge: {e}", file=sys.stderr)
             return None
     elif RUN_MODE in ("PC_ADB", "LOCAL_LADB"):
+        # Prefer the continuous minicap stream when enabled; fall back to a
+        # fresh screencap grab if no frame is ready yet.
+        frame = _minicap_frame()
+        if frame is not None:
+            return frame
         raw_image = adb_capture_raw_image()
         if raw_image is not None:
             return raw_image

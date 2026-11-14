@@ -1,0 +1,1 @@
+minicap-prebuilt 2.7.4 (DeviceFarmer), Apache-2.0

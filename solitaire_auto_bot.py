@@ -621,6 +621,18 @@ def parse_args(argv=None):
              "zero interval, exact coordinates, and fixed 180ms drags.",
     )
     parser.add_argument(
+        "--minicap",
+        action="store_true",
+        help="Capture frames from a continuous minicap stream (30-60fps while "
+             "the screen animates) instead of per-call screencap. Falls back to "
+             "screencap automatically if the stream can't start or has no frame.",
+    )
+    parser.add_argument(
+        "--minicap-serial",
+        default=None,
+        help="adb serial to attach minicap to (default: the current adb device).",
+    )
+    parser.add_argument(
         "--human",
         action="store_true",
         help="Restore human-like coordinate jitter, 720-860ms drags, and a "
@@ -762,6 +774,12 @@ def main():
 
     if args.interval is None:
         args.interval = 0.0
+    if args.minicap:
+        try:
+            bridge.enable_minicap(serial=args.minicap_serial)
+        except Exception as e:
+            print(f"[Warn] minicap stream unavailable ({e}); using screencap.",
+                  file=sys.stderr)
     if args.human:
         # Opt back into the old slow, randomized profile.
         bridge.configure_timing(human_mode=True, human_pacing=True)
